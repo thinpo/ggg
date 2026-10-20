@@ -14,6 +14,25 @@ go build -o ggg .        # in this directory
 ./ggg -root ~/src        # sync every repo under ~/src
 ```
 
+## Install
+
+Download the archive for your platform from the
+[releases page](https://github.com/thinpo/ggg/releases):
+
+```sh
+tar xzf ggg-darwin-arm64_1.0.0.tar.gz
+mv ggg-darwin-arm64 ~/local/bin/ggg
+```
+
+or build it from source:
+
+```sh
+git clone https://github.com/thinpo/ggg.git
+cd ggg && make install        # installs into ~/local/bin/ggg
+```
+
+`make` alone runs gofmt, go vet, the test suite and a build.
+
 ## What it does per repository
 
 | Situation | What `ggg` does |
@@ -121,3 +140,15 @@ resulting state:
 ```
 ./test.sh          # builds ./ggg first if needed
 ```
+
+## Releasing
+
+```sh
+make release       # ./release.sh <version>
+```
+
+Cross-compiles the binaries for every supported platform, writes the
+`SHA256SUMS` file, tags `v<version>`, pushes the tag and publishes the
+GitHub release with the archives attached. The version embedded in the
+binaries comes from the `version` variable in `main.go` and can be overridden
+with `-ldflags "-X main.version=..."`.

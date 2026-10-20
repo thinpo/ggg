@@ -46,10 +46,11 @@ import (
 	"time"
 )
 
-const (
-	progName = "ggg"
-	version  = "1.0.0"
-)
+const progName = "ggg"
+
+// version is the release version. It is overridden at build time with
+// -ldflags "-X main.version=1.2.3".
+var version = "1.0.0"
 
 // ---------------------------------------------------------------------------
 // configuration

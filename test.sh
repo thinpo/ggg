@@ -7,9 +7,13 @@ set -u
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 GG=${1:-$HERE/ggg}
+# The fixtures live in a temporary directory and the script changes into it,
+# so the binary must be addressed by an absolute path.
+GG="$(cd "$(dirname "$GG")" && pwd)/$(basename "$GG")"
 if [ ! -x "$GG" ]; then
   echo "building ggg..."
   (cd "$HERE" && go build -o ggg .) || exit 1
+  GG="$HERE/ggg"
 fi
 
 BASE=$(mktemp -d "${TMPDIR:-/tmp}/gggtest.XXXXXX")
