@@ -53,7 +53,7 @@ const progName = "ggg"
 
 // version is the release version. It is overridden at build time with
 // -ldflags "-X main.version=1.2.3".
-var version = "1.3.0"
+var version = "1.4.0"
 
 // ---------------------------------------------------------------------------
 // configuration
@@ -74,9 +74,14 @@ type config struct {
 	verbose        bool
 	switchDetached bool
 	skipSubmodules bool
-	skipRE         *regexp.Regexp
-	maxDepth       int
-	timeout        time.Duration
+	syncSubmodules bool
+	// repos holds the repositories of this run, keyed by their canonical
+	// path. A submodule whose parent is in the set is synced with its
+	// parent, not on its own.
+	repos    map[string]bool
+	skipRE   *regexp.Regexp
+	maxDepth int
+	timeout  time.Duration
 }
 
 func (c *config) resolveStrategies() []string {
@@ -167,12 +172,26 @@ func (g git) prefix() []string {
 	return p
 }
 
-func (g git) run(args ...string) error {
+// readOnlyEnv is the environment of a read-only git command.
+//
+// GIT_OPTIONAL_LOCKS=0 tells git not to take the optional index lock: a
+// command that only looks at a repository then never writes the index and
+// never blocks - and is never blocked by - another git process that is
+// writing the very same index. This matters for submodules: a status in the
+// parent repository runs a status inside the submodule, which would take the
+// submodule's index lock.
+var readOnlyEnv = []string{"GIT_OPTIONAL_LOCKS=0"}
+
+// execGit runs a git command in the repository and returns its stdout.
+//
+// extraEnv is added to the environment of the command.
+func (g git) execGit(extraEnv []string, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), g.timeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "git", append(g.prefix(), args...)...)
 	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "LC_ALL=C")
+	cmd.Env = append(cmd.Env, extraEnv...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -188,9 +207,20 @@ func (g git) run(args ...string) error {
 		if ctx.Err() == context.DeadlineExceeded {
 			msg = "timed out after " + g.timeout.String()
 		}
-		return fmt.Errorf("git %s: %s", strings.Join(args, " "), msg)
+		return stdout.String(), fmt.Errorf("git %s: %s", strings.Join(args, " "), msg)
 	}
-	return nil
+	return stdout.String(), nil
+}
+
+func (g git) run(args ...string) error {
+	_, err := g.execGit(nil, args...)
+	return err
+}
+
+// runRead runs a command that only looks at the repository.
+func (g git) runRead(args ...string) error {
+	_, err := g.execGit(readOnlyEnv, args...)
+	return err
 }
 
 // mutate runs a command that changes the repository. In dry-run mode the
@@ -201,33 +231,77 @@ func (g git) mutate(args ...string) error {
 		g.log("  would run: git " + strings.Join(args, " "))
 		return nil
 	}
-	return g.run(args...)
+	var err error
+	for attempt := 0; attempt <= len(lockDelays); attempt++ {
+		if attempt > 0 {
+			g.log("  waiting " + lockDelays[attempt-1].String() + " for the lock to free up ...")
+			time.Sleep(lockDelays[attempt-1])
+		}
+		err = g.run(args...)
+		if err == nil {
+			return nil
+		}
+		path, locked := lockContention(err)
+		if !locked {
+			return err
+		}
+		if attempt == len(lockDelays) {
+			return lockHeld(path, err)
+		}
+	}
+	return err
 }
 
 // output runs a command and returns its trimmed stdout.
+//
+// The command is read-only, so it runs without the optional index lock.
 func (g git) output(args ...string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), g.timeout)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, "git", append(g.prefix(), args...)...)
-	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "LC_ALL=C")
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		msg := strings.TrimSpace(stderr.String())
-		if msg == "" {
-			msg = err.Error()
-		}
-		return "", fmt.Errorf("git %s: %s", strings.Join(args, " "), msg)
+	out, err := g.execGit(readOnlyEnv, args...)
+	if err != nil {
+		return "", err
 	}
-	return strings.TrimRight(stdout.String(), "\n"), nil
+	return strings.TrimRight(out, "\n"), nil
 }
 
 // ok reports whether a command succeeds.
 func (g git) ok(args ...string) bool {
-	return g.run(args...) == nil
+	return g.runRead(args...) == nil
+}
+
+// lockDelays is how long ggg waits before it tries again when another git
+// process holds a lock file.
+var lockDelays = []time.Duration{500 * time.Millisecond, 1500 * time.Millisecond}
+
+// lockFileRE finds the lock file in the message of a failed git command.
+var lockFileRE = regexp.MustCompile(`Unable to create '([^']+)': File exists`)
+
+// lockContention reports whether a failed git command lost the race for a
+// lock file, and returns the path of the lock.
+func lockContention(err error) (string, bool) {
+	if err == nil {
+		return "", false
+	}
+	msg := err.Error()
+	if m := lockFileRE.FindStringSubmatch(msg); m != nil {
+		return m[1], true
+	}
+	switch {
+	case strings.Contains(msg, "index.lock"),
+		strings.Contains(msg, "packed-refs.lock"),
+		strings.Contains(msg, "could not write index"),
+		strings.Contains(msg, "cannot lock ref"),
+		strings.Contains(msg, "Unable to create") && strings.Contains(msg, ".lock"):
+		return "", true
+	}
+	return "", false
+}
+
+// lockHeld describes a lock file that another process holds.
+func lockHeld(path string, err error) error {
+	if path == "" {
+		return fmt.Errorf("another git process is using this repository, try again later: %w", err)
+	}
+	return fmt.Errorf("another git process is using this repository (lock %s), try again later: %w", path, err)
 }
 
 func (g git) gitDir() string {
@@ -240,16 +314,16 @@ func (g git) gitDir() string {
 
 // refExists reports whether a commit-ish resolves.
 func (g git) refExists(ref string) bool {
-	return g.run("rev-parse", "--verify", "--quiet", ref+"^{commit}") == nil
+	return g.runRead("rev-parse", "--verify", "--quiet", ref+"^{commit}") == nil
 }
 
 // isAncestor reports whether a is an ancestor of b (b contains a).
 func (g git) isAncestor(a, b string) bool {
-	return g.run("merge-base", "--is-ancestor", a, b) == nil
+	return g.runRead("merge-base", "--is-ancestor", a, b) == nil
 }
 
 func (g git) branchExists(name string) bool {
-	return g.run("show-ref", "--verify", "--quiet", "refs/heads/"+name) == nil
+	return g.runRead("show-ref", "--verify", "--quiet", "refs/heads/"+name) == nil
 }
 
 // unmerged reports the number of conflicted paths in the index.
@@ -266,7 +340,7 @@ func (g git) unmerged() int {
 }
 
 func (g git) hasCommits() bool {
-	return g.run("rev-parse", "--verify", "--quiet", "HEAD") == nil
+	return g.runRead("rev-parse", "--verify", "--quiet", "HEAD") == nil
 }
 
 // inProgressOp names the unfinished git operation, if any.
@@ -560,7 +634,7 @@ func (s *syncer) restoreHidden(path string) (bool, string) {
 	// The repository is back as soon as one of its remotes answers again.
 	var lastErr error
 	for _, r := range remotes {
-		lastErr = g.run("ls-remote", r)
+		lastErr = g.runRead("ls-remote", r)
 		if lastErr != nil {
 			continue
 		}
@@ -702,6 +776,48 @@ type syncer struct {
 	cfg config
 }
 
+// skipSubmodule reports whether a repository must be left alone because it is
+// a submodule of another repository.
+//
+// The commit a submodule points at belongs to the parent: the parent decides
+// which commit is checked out. Syncing the submodule on its own therefore
+// fights the parent - and both write the same index, which is how a parallel
+// run ends up in "Unable to create index.lock: File exists".
+//
+// A submodule whose parent is part of the same run is therefore skipped.
+// -skip-submodules leaves every submodule alone, also the ones whose parent
+// is not part of the run, and -sync-submodules syncs them all.
+func (s *syncer) skipSubmodule(g git) (bool, string) {
+	super := g.superproject()
+	if super == "" {
+		return false, ""
+	}
+	if s.cfg.syncSubmodules {
+		return false, ""
+	}
+	if s.cfg.skipSubmodules {
+		return true, "submodule of " + filepath.Base(super) + "; skipped"
+	}
+	if s.cfg.repos[canonical(super)] {
+		return true, "submodule of " + filepath.Base(super) + "; skipped (synced with its parent)"
+	}
+	return false, ""
+}
+
+// canonical returns the path that identifies a location: the absolute path
+// with symbolic links resolved, so that two ways of naming the same
+// directory compare equal.
+func canonical(path string) string {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		abs = path
+	}
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		return resolved
+	}
+	return abs
+}
+
 func (s *syncer) syncOne(path string) result {
 	start := time.Now()
 	res := result{repo: path, st: statusOK}
@@ -753,10 +869,8 @@ func (s *syncer) syncOne(path string) result {
 
 	// The commit a submodule points at belongs to the parent repository, not
 	// to us: leave those repositories alone unless asked otherwise.
-	if s.cfg.skipSubmodules {
-		if super := g.superproject(); super != "" {
-			return res.skip(start, "submodule of "+filepath.Base(super)+"; skipped")
-		}
+	if skip, reason := s.skipSubmodule(g); skip {
+		return res.skip(start, reason)
 	}
 
 	// --- 2. fetch -----------------------------------------------------------
@@ -1179,7 +1293,8 @@ func main() {
 	flag.BoolVar(&cfg.mergeUptr, "merge-upstream", true, "also merge the branch's own upstream into the branch")
 	flag.BoolVar(&cfg.push, "push", false, "push the current branch to its upstream after syncing")
 	flag.BoolVar(&cfg.submodules, "submodules", false, "run 'git submodule update --init --recursive' after syncing")
-	flag.BoolVar(&cfg.skipSubmodules, "skip-submodules", false, "leave repositories that are submodules of another repository untouched")
+	flag.BoolVar(&cfg.skipSubmodules, "skip-submodules", false, "leave every repository that is a submodule of another repository untouched")
+	flag.BoolVar(&cfg.syncSubmodules, "sync-submodules", false, "sync repositories that are submodules of another repository too (the default syncs a submodule with its parent)")
 	flag.BoolVar(&cfg.switchDetached, "switch-detached", false, "move a detached HEAD to the default branch and sync it")
 	flag.BoolVar(&cfg.recover, "recover", false, "abort an unfinished merge/rebase and continue")
 	flag.BoolVar(&cfg.listOnly, "list", false, "list the repositories and exit")
@@ -1214,6 +1329,10 @@ func main() {
 			os.Exit(2)
 		}
 		cfg.skipRE = re
+	}
+	if cfg.skipSubmodules && cfg.syncSubmodules {
+		fmt.Fprintf(os.Stderr, "%s: -skip-submodules and -sync-submodules contradict each other\n", progName)
+		os.Exit(2)
 	}
 	cfg.autoResolve = strings.Split(*autoResolve, ",")
 	cfg.timeout = *timeout
@@ -1254,6 +1373,13 @@ func main() {
 		}
 	}
 	sort.Strings(repos)
+
+	// The repositories of this run: a submodule whose parent is one of them
+	// is synced with its parent, not on its own.
+	s.cfg.repos = make(map[string]bool, len(repos))
+	for _, r := range repos {
+		s.cfg.repos[canonical(r)] = true
+	}
 
 	if len(repos) == 0 {
 		fmt.Printf("%s: no git repositories found under %s\n", progName, root)
@@ -1383,7 +1509,9 @@ Flags:
   -merge-upstream    also merge the branch's own upstream into the branch (default true)
   -push              push the current branch to its upstream after syncing
   -submodules        run "git submodule update --init --recursive" afterwards
-  -skip-submodules   leave repositories that are submodules of another repository untouched
+  -skip-submodules   leave every repository that is a submodule of another repository untouched
+  -sync-submodules   sync submodules on their own too (the default syncs a submodule
+                     together with the repository that points at it)
   -switch-detached   move a detached HEAD to the default branch and sync it
   -recover           abort an unfinished merge/rebase and continue
   -list              list the repositories and exit

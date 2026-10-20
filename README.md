@@ -47,11 +47,59 @@ cd ggg && make install        # installs into ~/local/bin/ggg
 | merge still conflicts | aborts, keeps the feature branch and its local commits, switches to `main`/`master` and syncs that instead |
 | detached HEAD | fetched only and reported — the commit is not moved (`-switch-detached` opts in) |
 | stash pop conflicts | the stash is **kept** and the conflict is reported — nothing is lost |
+| another git process holds a lock file | the command is waited for and tried again — the repository is not failed |
+| a submodule of a repository in the same run | synced with its parent (see [Submodules](#submodules)) |
 | remote repository is gone (deleted, renamed, no longer visible) | the local copy is all that is left: the repository is skipped and left completely untouched — nothing is synced, nothing is renamed |
 | the remote of a repository hidden by ggg 1.1 is back | `.git_old` is renamed back to `.git` and the repository is synced again |
 
 Default branch detection order: `origin/HEAD` → `main` → `master` → first
 branch on the remote.
+
+## Submodules
+
+The commit a submodule points at belongs to the repository that points at it:
+the parent decides which commit is checked out. A submodule whose parent is
+part of the same run is therefore synced **with** its parent and left alone
+otherwise:
+
+```
+SKIP  subparent/sub   submodule of subparent; skipped (synced with its parent)
+```
+
+This is not only the semantically right thing to do, it also avoids two
+processes writing the same index: a command in the parent repository (a
+`status`, a `stash`) runs inside every submodule and takes the submodule's
+index lock. When the submodule is synced on its own at the same time, the two
+collide:
+
+```
+FAIL  subparent/sub   could not stash local changes: git stash push: error:
+      Unable to create '…/.git/modules/sub/index.lock': File exists.
+```
+
+Three flags change this:
+
+* *(default)* a submodule whose parent is part of the run is synced with its
+  parent.
+* `-sync-submodules` syncs every submodule on its own too — the parent keeps
+  its pointer, the submodule is fetched.
+* `-skip-submodules` leaves every submodule alone, also the ones whose parent
+  is not part of the run.
+
+## Lock files
+
+Another git process — an IDE, another terminal, a second `ggg` run — can hold a
+lock file of a repository. `ggg` does not fail the repository because of that:
+
+* commands that only look at a repository run with `GIT_OPTIONAL_LOCKS=0`, so
+  they never take the optional index lock and never block another git process;
+* a command that lost the race for a lock file is waited for and tried again;
+* a lock that is never released is reported as such:
+
+```
+FAIL  alpha   another git process is using this repository (lock
+      /home/me/src/alpha/.git/index.lock), try again later: git stash push: …
+```
 
 ## Local-only repositories
 
@@ -117,7 +165,9 @@ mv repo/.git_old repo/.git
   -merge-upstream    also merge the branch's own upstream into the branch (default true)
   -push              push the current branch to its upstream after syncing
   -submodules        run "git submodule update --init --recursive" afterwards
-  -skip-submodules   leave repositories that are submodules of another repository untouched
+  -skip-submodules   leave every repository that is a submodule of another repository untouched
+  -sync-submodules   sync submodules on their own too (the default syncs a submodule
+                     together with the repository that points at it)
   -switch-detached   move a detached HEAD to the default branch and sync it
   -recover           abort an unfinished merge/rebase and continue
   -list              list the repositories and exit
@@ -142,7 +192,7 @@ first parent of the merge commit.
 ## Output
 
 ```
-ggg 1.3.0 — syncing 5 repositories under /home/me/src
+ggg 1.4.0 — syncing 5 repositories under /home/me/src
 
 RESTORE old    remote origin is back; .git_old renamed back to .git
 HIDDEN  gone   the remote is still gone
@@ -170,9 +220,12 @@ Exit code is `1` only when a repository actually failed.
   inside another repo's working tree) are synced as well — each one
   independently.
 * A submodule lives on a detached HEAD at the commit its parent pins. `ggg`
-  fetches it but does not move it, so the parent's pointer stays put. Use
-  `-switch-detached` to move it to the default branch, or `-skip-submodules`
-  to leave submodule repositories completely alone. Syncing a submodule that
+  fetches it but does not move it, so the parent's pointer stays put. A
+  submodule of a repository in the same run is not synced at all, because the
+  parent decides which commit it holds — see [Submodules](#submodules). Use
+  `-switch-detached` to move a submodule to the default branch,
+  `-sync-submodules` to sync a submodule on its own, or `-skip-submodules` to
+  leave submodule repositories completely alone. Syncing a submodule that
   *is* on a branch still moves the parent's pointer, because that is what
   syncing means.
 * `node_modules`, `venv`, `__pycache__` and similar directories are skipped by
@@ -189,8 +242,9 @@ Exit code is `1` only when a repository actually failed.
 algorithm (fast-forward, dirty tree, feature branch, conflicting feature
 branch, diverged main, `master` remote, unfinished merge, detached HEAD,
 nested repo, non-`origin` remote, repository without commits, deleted remote
-→ local-only repository, repository hidden by ggg 1.1 and restored) and asserts
-the resulting state:
+→ local-only repository, repository hidden by ggg 1.1 and restored, submodule
+of a repository in the same run, and a repository whose lock file is held by
+another process) and asserts the resulting state:
 
 ```
 ./test.sh          # builds ./ggg first if needed

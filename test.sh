@@ -101,9 +101,12 @@ git -C "$WORK/fresh" remote add origin "$REMOTE/fresh.git"
 git init --bare -q -b main "$WORK/bare.git"
 # 14 a real submodule inside a parent repository
 seed subparent; git clone -q "$REMOTE/subparent.git" "$WORK/subparent"
-git -C "$WORK/subparent" -c protocol.file.allow=always submodule add -q "$REMOTE/inner.git" sub 2>/dev/null
+seed submod
+git -C "$WORK/subparent" -c protocol.file.allow=always submodule add -q "$REMOTE/submod.git" sub 2>/dev/null
 git -C "$WORK/subparent" commit -q -m "add submodule" 2>/dev/null
 git -C "$WORK/subparent" -c protocol.file.allow=always submodule update --init -q 2>/dev/null
+# The remote of the submodule moves ahead: the checkout stays behind.
+remote_commit submod
 # 15 parent whose only local change is a moved submodule pointer: git refuses
 #    to stash submodule pointers, so "git stash push" saves nothing.
 seed pointer; git clone -q "$REMOTE/pointer.git" "$WORK/pointer"
@@ -135,10 +138,53 @@ SYNC_OUT=$(cd "$WORK" && NO_COLOR=1 "$GG" 2>&1)
 echo "$SYNC_OUT" | tail -25
 
 echo
-echo "== skip-submodules =="
+echo "== submodules =="
+# The commit of a submodule belongs to the repository that points at it, so a
+# submodule whose parent is part of the same run is synced with its parent.
+SUB_ORIGIN_BEFORE=$(git -C "$WORK/subparent/sub" rev-parse origin/main)
+out=$(cd "$WORK" && NO_COLOR=1 "$GG" 2>&1)
+check "submodule skipped by default" "yes" \
+  "$(echo "$out" | grep 'subparent/sub' | grep -q 'submodule of subparent; skipped' && echo yes || echo no)"
+check "submodule not fetched by default" "$SUB_ORIGIN_BEFORE" \
+  "$(git -C "$WORK/subparent/sub" rev-parse origin/main)"
+# -sync-submodules syncs the submodule on its own.
+out=$(cd "$WORK" && NO_COLOR=1 "$GG" -sync-submodules 2>&1)
+check "submodule not skipped with -sync-submodules" "no" \
+  "$(echo "$out" | grep 'subparent/sub' | grep -q 'submodule of subparent; skipped' && echo yes || echo no)"
+check "submodule fetched with -sync-submodules" "$(git -C "$REMOTE/submod.git" rev-parse main)" \
+  "$(git -C "$WORK/subparent/sub" rev-parse origin/main)"
+# -skip-submodules leaves every submodule alone.
 out=$(cd "$WORK" && NO_COLOR=1 "$GG" -skip-submodules 2>&1)
 check "submodule reported as skipped" "yes" \
-  "$(echo "$out" | grep -q 'submodule of subparent; skipped' && echo yes || echo no)"
+  "$(echo "$out" | grep 'subparent/sub' | grep -q 'submodule of subparent; skipped' && echo yes || echo no)"
+check "contradicting flags rejected" "2" \
+  "$(cd "$WORK" && NO_COLOR=1 "$GG" -skip-submodules -sync-submodules >/dev/null 2>&1; echo $?)"
+
+echo
+echo "== lock contention =="
+# Another git process holds the index lock: ggg waits for it instead of
+# failing the repository.
+seed locked; git clone -q "$REMOTE/locked.git" "$WORK/locked"
+remote_commit locked
+echo "local edit" >> "$WORK/locked/file.txt"
+touch "$WORK/locked/.git/index.lock"
+( sleep 1; rm -f "$WORK/locked/.git/index.lock" ) &
+LOCKOUT=$(cd "$WORK" && NO_COLOR=1 "$GG" 2>&1)
+check "no failure while a lock is held" "0" "$(echo "$LOCKOUT" | grep -c '^FAIL')"
+check "locked repository synced" "yes" \
+  "$(git -C "$WORK/locked" merge-base --is-ancestor origin/main HEAD && echo yes || echo no)"
+check "locked repository keeps its work" " M file.txt" \
+  "$(git -C "$WORK/locked" status --porcelain | head -1)"
+check "locked repository has no stash left" "" "$(git -C "$WORK/locked" stash list)"
+
+# A lock that is never released is reported as such.
+seed stuck; git clone -q "$REMOTE/stuck.git" "$WORK/stuck"
+echo "local edit" >> "$WORK/stuck/file.txt"
+touch "$WORK/stuck/.git/index.lock"
+STUCKOUT=$(cd "$WORK" && NO_COLOR=1 "$GG" 2>&1)
+rm -f "$WORK/stuck/.git/index.lock"
+check "a lock that is never released is reported" "yes" \
+  "$(echo "$STUCKOUT" | grep -q 'another git process is using this repository' && echo yes || echo no)"
 
 echo
 echo "== recovery =="
@@ -151,8 +197,6 @@ echo
 echo "== checks =="
 check "alpha fast-forwarded" "$(git -C "$WORK/alpha" rev-parse origin/main)" "$(git -C "$WORK/alpha" rev-parse HEAD)"
 check "alpha clean" "" "$(git -C "$WORK/alpha" status --porcelain)"
-check "submodule synced by default" "$(git -C "$WORK/subparent/sub" rev-parse origin/main)" \
-  "$(git -C "$WORK/subparent/sub" rev-parse HEAD)"
 check "beta local edit kept" " M file.txt" "$(git -C "$WORK/beta" status --porcelain | head -1)"
 check "beta untracked kept" "?? untracked.txt" "$(git -C "$WORK/beta" status --porcelain | tail -1)"
 check "beta no stash left" "" "$(git -C "$WORK/beta" stash list)"
