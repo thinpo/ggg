@@ -10,7 +10,11 @@
 //
 //  1. Detects an unfinished merge/rebase/cherry-pick and refuses to touch the
 //     repository (or aborts it with -recover).
-//  2. Fetches the remote with --prune.
+//  2. Fetches the remote with --prune. If the remote repository itself is
+//     gone (deleted, renamed, no longer visible), the git metadata is renamed
+//     to .git_old so the next run skips that directory instead of failing
+//     again. Nothing is deleted: renaming .git_old back restores the
+//     repository.
 //  3. If the working tree is dirty, stashes it (including untracked files)
 //     before touching history and pops it afterwards.
 //  4. On the default branch (main/master): fast-forwards when possible, and
@@ -50,7 +54,7 @@ const progName = "ggg"
 
 // version is the release version. It is overridden at build time with
 // -ldflags "-X main.version=1.2.3".
-var version = "1.0.1"
+var version = "1.1.0"
 
 // ---------------------------------------------------------------------------
 // configuration
@@ -434,11 +438,76 @@ func (g git) defaultBranch(remote string, candidates []string) string {
 }
 
 // ---------------------------------------------------------------------------
+// gone remotes
+// ---------------------------------------------------------------------------
+
+// goneRemotePhrases are the error fragments git prints when the remote
+// repository itself no longer exists: it was deleted, renamed, or is not
+// visible to this user any more.
+//
+// Authentication and network failures are deliberately absent: in those cases
+// the repository is still alive and must keep being synced.
+var goneRemotePhrases = []string{
+	"repository not found",
+	"repo not found",
+	"repository does not exist",
+	"remote repository does not exist",
+	"does not appear to be a git repository",
+	"requested url returned error: 404",
+	"the project you were looking for could not be found",
+}
+
+// isGoneRemote reports whether err means that the remote repository is gone.
+func isGoneRemote(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, p := range goneRemotePhrases {
+		if strings.Contains(msg, p) {
+			return true
+		}
+	}
+	// "fatal: repository 'https://host/user/name.git/' not found"
+	if strings.Contains(msg, "not found") &&
+		(strings.Contains(msg, "repository") || strings.Contains(msg, "repo") || strings.Contains(msg, "project")) {
+		return true
+	}
+	return false
+}
+
+// hideGitDir renames the repository metadata from .git to .git_old so the
+// directory stops being recognised as a git repository: the next scan skips
+// it instead of failing again.
+//
+// Nothing is lost. The objects, the refs and the whole history stay in
+// .git_old, and renaming it back restores the repository.
+func hideGitDir(path string) (string, error) {
+	src := filepath.Join(path, ".git")
+	if _, err := os.Lstat(src); err != nil {
+		return "", err
+	}
+	dst := filepath.Join(path, ".git_old")
+	if _, err := os.Lstat(dst); err == nil {
+		// Never overwrite an earlier .git_old: move it aside first.
+		aside := fmt.Sprintf("%s.%s", dst, time.Now().Format("20060102-150405"))
+		if err := os.Rename(dst, aside); err != nil {
+			return "", fmt.Errorf("could not move the existing .git_old aside: %w", err)
+		}
+	}
+	if err := os.Rename(src, dst); err != nil {
+		return "", err
+	}
+	return dst, nil
+}
+
+// ---------------------------------------------------------------------------
 // discovery
 // ---------------------------------------------------------------------------
 
 var defaultSkipDirs = map[string]bool{
 	".git":          true,
+	".git_old":      true,
 	"node_modules":  true,
 	"__pycache__":   true,
 	".venv":         true,
@@ -585,10 +654,24 @@ func (s *syncer) syncOne(path string) result {
 
 	// --- 2. fetch -----------------------------------------------------------
 	fetchFailed := false
+	if s.cfg.dryRun {
+		// The planned fetch is not executed, so the remote is probed with a
+		// read-only ls-remote: the plan has to know whether the remote is
+		// still there.
+		if _, err := g.output("ls-remote", "--exit-code", remote); err != nil && isGoneRemote(err) {
+			return s.handleGoneRemote(path, start, &res, err)
+		}
+	}
 	if err := g.mutate("fetch", "--prune", remote); err != nil {
 		fetchFailed = true
 		res.st = statusWarn
 		res.note("fetch failed: %v", err)
+		if isGoneRemote(err) {
+			// The remote repository itself is gone. Move the git metadata
+			// out of the way so that the next scan skips this directory
+			// instead of failing on it again.
+			return s.handleGoneRemote(path, start, &res, err)
+		}
 	}
 
 	// --- 3. branch layout ---------------------------------------------------
@@ -728,6 +811,30 @@ func (s *syncer) syncOne(path string) result {
 		}
 	}
 
+	return res.finish(start)
+}
+
+// handleGoneRemote reacts to a remote repository that no longer exists.
+//
+// The git metadata is renamed to .git_old: the directory keeps all of its
+// files and history, but it is no longer a git repository, so the next scan
+// skips it.
+func (s *syncer) handleGoneRemote(path string, start time.Time, res *result, fetchErr error) result {
+	res.st = statusSkip
+	res.summary = "remote repository is gone"
+	res.note("%v", fetchErr)
+	if s.cfg.dryRun {
+		res.summary += "; would rename .git to .git_old"
+		return res.finish(start)
+	}
+	dst, err := hideGitDir(path)
+	if err != nil {
+		res.st = statusWarn
+		res.summary = "remote repository is gone; could not rename .git: " + err.Error()
+		return res.finish(start)
+	}
+	res.summary = "remote repository is gone; renamed .git to " + filepath.Base(dst)
+	res.note("rename %s back to .git to bring the repository back", filepath.Base(dst))
 	return res.finish(start)
 }
 

@@ -111,6 +111,10 @@ git -C "$WORK/pointer" -c protocol.file.allow=always submodule add -q "$REMOTE/i
 git -C "$WORK/pointer" commit -q -m "add submodule" 2>/dev/null
 git -C "$WORK/pointer" -c protocol.file.allow=always submodule update --init -q 2>/dev/null
 git -C "$WORK/pointer/sub" commit -q --allow-empty -m "submodule moved" 2>/dev/null
+# 16 a repository whose remote was deleted: the remote is gone, so ggg moves
+#    the git metadata to .git_old and the next run skips the directory.
+seed vanished; git clone -q "$REMOTE/vanished.git" "$WORK/vanished"
+rm -rf "$REMOTE/vanished.git"
 
 echo
 echo "== dry run =="
@@ -157,6 +161,11 @@ check "nothing failed" "0" "$(echo "$SYNC_OUT" | grep -c '^FAIL')"
 check "pointer parent synced" "origin/main" "$(git -C "$WORK/pointer" rev-parse --abbrev-ref '@{upstream}')"
 check "pointer submodule kept" " M sub" "$(git -C "$WORK/pointer" status --porcelain | head -1)"
 check "pointer no stash left" "" "$(git -C "$WORK/pointer" stash list)"
+check "gone remote renamed .git" "no" "$([ -e "$WORK/vanished/.git" ] && echo yes || echo no)"
+check "gone remote kept as .git_old" "yes" "$([ -d "$WORK/vanished/.git_old" ] && echo yes || echo no)"
+check "gone remote history intact" "init" "$(git --git-dir="$WORK/vanished/.git_old" log --oneline -1 | cut -d' ' -f2-)"
+check "gone remote skipped next run" "no" \
+  "$(cd "$WORK" && NO_COLOR=1 "$GG" -list | grep -q 'vanished' && echo yes || echo no)"
 
 echo
 echo "passed: $pass  failed: $fail"

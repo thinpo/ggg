@@ -47,9 +47,34 @@ cd ggg && make install        # installs into ~/local/bin/ggg
 | merge still conflicts | aborts, keeps the feature branch and its local commits, switches to `main`/`master` and syncs that instead |
 | detached HEAD | fetched only and reported — the commit is not moved (`-switch-detached` opts in) |
 | stash pop conflicts | the stash is **kept** and the conflict is reported — nothing is lost |
+| remote repository is gone (deleted, renamed, no longer visible) | `.git` is renamed to `.git_old`, so the next run skips the directory |
 
 Default branch detection order: `origin/HEAD` → `main` → `master` → first
 branch on the remote.
+
+## Gone remotes
+
+When a remote repository no longer exists — it was deleted, renamed, or it is
+not visible to this user any more — `ggg` does not keep failing on it. It
+renames the git metadata:
+
+```
+repo/.git  →  repo/.git_old
+```
+
+The directory keeps **all** of its files and the **whole** history; it simply
+is not a git repository any more, so the next scan skips it instead of
+reporting the same error again. Nothing is deleted, and the repository can be
+brought back at any time:
+
+```sh
+mv repo/.git_old repo/.git
+```
+
+Only a remote that is really gone triggers this. Authentication failures
+(`Permission denied`, `could not read Username`) and network problems
+(`Could not resolve host`) leave the repository alone: it is still alive and
+keeps being synced.
 
 ## Safety rules
 
@@ -57,6 +82,7 @@ branch on the remote.
 * Never `reset --hard` — a repository that has no commits yet is simply
   pointed at the remote branch instead.
 * Never drops a stash that did not apply cleanly.
+* Never deletes a repository — a gone remote only renames `.git` to `.git_old`.
 * Only ever creates merge commits — local history is never rewritten.
 
 ## Flags
@@ -96,18 +122,20 @@ first parent of the merge commit.
 ## Output
 
 ```
-ggg 1.0.0 — syncing 6 repositories under /home/me/src
+ggg 1.0.0 — syncing 5 repositories under /home/me/src
 
 OK   alpha  fast-forward to origin/main
 WARN beta   stash apply conflicted (stash kept: 305f50b7)
 SKIP noremote  no remote configured
+SKIP old    remote repository is gone; renamed .git to .git_old
 
 ────────────────────────────────────────────────────────────────────────
 OK    alpha     main        fast-forward to origin/main
 WARN  beta      main        stash apply conflicted (stash kept: 305f50b7)
 SKIP  noremote  -           no remote configured
+SKIP  old       -           remote repository is gone; renamed .git to .git_old
 ────────────────────────────────────────────────────────────────────────
-OK 2   WARN 1   FAIL 0   SKIP 1   (4 total)
+OK 2   WARN 1   FAIL 0   SKIP 2   (5 total)
 ```
 
 Exit code is `1` only when a repository actually failed.
@@ -126,6 +154,8 @@ Exit code is `1` only when a repository actually failed.
   syncing means.
 * `node_modules`, `venv`, `__pycache__` and similar directories are skipped by
   default; use `-skip` to add your own patterns.
+* `.git_old` directories are skipped as well, so a repository whose remote is
+  gone is not descended into.
 * Symlinked directories are not followed.
 * The scan reads the working tree only; it never rewrites history.
 
@@ -134,8 +164,8 @@ Exit code is `1` only when a repository actually failed.
 `test.sh` builds throw-away remotes and clones covering every branch of the
 algorithm (fast-forward, dirty tree, feature branch, conflicting feature
 branch, diverged main, `master` remote, unfinished merge, detached HEAD,
-nested repo, non-`origin` remote, repository without commits) and asserts the
-resulting state:
+nested repo, non-`origin` remote, repository without commits, deleted remote)
+and asserts the resulting state:
 
 ```
 ./test.sh          # builds ./ggg first if needed

@@ -1,5 +1,6 @@
 BINARY := ggg
-VERSION ?= $(shell sed -n 's/^var version = "\(.*\)"$/\1/p' main.go)
+# The trailing $$ is needed: make would eat a single $ in the sed pattern.
+VERSION ?= $(shell sed -n 's/^var version = "\(.*\)"$$/\1/p' main.go)
 LDFLAGS := -s -w -X main.version=$(VERSION)
 DIST := dist
 
