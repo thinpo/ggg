@@ -26,8 +26,7 @@ go build -o ggg .        # in this directory
 | on a feature branch | merges the branch's own upstream and then `origin/main` into it |
 | merge conflicts | retries with `-X theirs` (remote wins the conflicting hunks) so the remote history still lands locally; your version stays in the commit history |
 | merge still conflicts | aborts, keeps the feature branch and its local commits, switches to `main`/`master` and syncs that instead |
-| detached HEAD contained in the remote mainline | switches to the default branch and syncs it |
-| detached HEAD with its own commits | left untouched and reported |
+| detached HEAD | fetched only and reported — the commit is not moved (`-switch-detached` opts in) |
 | stash pop conflicts | the stash is **kept** and the conflict is reported — nothing is lost |
 
 Default branch detection order: `origin/HEAD` → `main` → `master` → first
@@ -53,6 +52,8 @@ branch on the remote.
   -merge-upstream    also merge the branch's own upstream into the branch (default true)
   -push              push the current branch to its upstream after syncing
   -submodules        run "git submodule update --init --recursive" afterwards
+  -skip-submodules   leave repositories that are submodules of another repository untouched
+  -switch-detached   move a detached HEAD to the default branch and sync it
   -recover           abort an unfinished merge/rebase and continue
   -list              list the repositories and exit
   -maxdepth int      maximum directory depth to scan (0 = unlimited)
@@ -97,8 +98,13 @@ Exit code is `1` only when a repository actually failed.
 * Repositories are found by looking for a `.git` directory *or* file, so
   worktrees and submodules are picked up too. Nested repositories (a repo
   inside another repo's working tree) are synced as well — each one
-  independently, and a submodule that sits on a detached HEAD is switched to
-  its default branch, which moves the parent's gitlink.
+  independently.
+* A submodule lives on a detached HEAD at the commit its parent pins. `ggg`
+  fetches it but does not move it, so the parent's pointer stays put. Use
+  `-switch-detached` to move it to the default branch, or `-skip-submodules`
+  to leave submodule repositories completely alone. Syncing a submodule that
+  *is* on a branch still moves the parent's pointer, because that is what
+  syncing means.
 * `node_modules`, `venv`, `__pycache__` and similar directories are skipped by
   default; use `-skip` to add your own patterns.
 * Symlinked directories are not followed.

@@ -95,6 +95,11 @@ seed fresh; git init -q -b main "$WORK/fresh"
 git -C "$WORK/fresh" remote add origin "$REMOTE/fresh.git"
 # 13 bare repository
 git init --bare -q -b main "$WORK/bare.git"
+# 14 a real submodule inside a parent repository
+seed subparent; git clone -q "$REMOTE/subparent.git" "$WORK/subparent"
+git -C "$WORK/subparent" -c protocol.file.allow=always submodule add -q "$REMOTE/inner.git" sub 2>/dev/null
+git -C "$WORK/subparent" commit -q -m "add submodule" 2>/dev/null
+git -C "$WORK/subparent" -c protocol.file.allow=always submodule update --init -q 2>/dev/null
 
 echo
 echo "== dry run =="
@@ -108,9 +113,17 @@ echo "== sync =="
 (cd "$WORK" && NO_COLOR=1 "$GG" 2>&1 | tail -25)
 
 echo
+echo "== skip-submodules =="
+out=$(cd "$WORK" && NO_COLOR=1 "$GG" -skip-submodules 2>&1)
+check "submodule reported as skipped" "yes" \
+  "$(echo "$out" | grep -q 'submodule of subparent; skipped' && echo yes || echo no)"
+
+echo
 echo "== checks =="
 check "alpha fast-forwarded" "$(git -C "$WORK/alpha" rev-parse origin/main)" "$(git -C "$WORK/alpha" rev-parse HEAD)"
 check "alpha clean" "" "$(git -C "$WORK/alpha" status --porcelain)"
+check "submodule synced by default" "$(git -C "$WORK/subparent/sub" rev-parse origin/main)" \
+  "$(git -C "$WORK/subparent/sub" rev-parse HEAD)"
 check "beta local edit kept" " M file.txt" "$(git -C "$WORK/beta" status --porcelain | head -1)"
 check "beta untracked kept" "?? untracked.txt" "$(git -C "$WORK/beta" status --porcelain | tail -1)"
 check "beta no stash left" "" "$(git -C "$WORK/beta" stash list)"
@@ -123,7 +136,7 @@ check "epsilon contains origin/main" "yes" "$(git -C "$WORK/epsilon" merge-base 
 check "epsilon local commit kept" "1" "$(git -C "$WORK/epsilon" log --oneline HEAD | grep -c 'local rewrite')"
 check "kappa uses master" "master" "$(git -C "$WORK/kappa" rev-parse --abbrev-ref HEAD)"
 check "eta untouched" "UU file.txt" "$(git -C "$WORK/eta" status --porcelain)"
-check "theta switched to main" "main" "$(git -C "$WORK/theta" rev-parse --abbrev-ref HEAD)"
+check "theta stays detached" "HEAD" "$(git -C "$WORK/theta" rev-parse --abbrev-ref HEAD)"
 check "nested repo synced" "origin/main" "$(git -C "$WORK/outer/vendor/inner" rev-parse --abbrev-ref '@{upstream}')"
 check "upstream remote used" "upstream/main" "$(git -C "$WORK/up" rev-parse --abbrev-ref '@{upstream}')"
 check "fresh repo initialised" "main" "$(git -C "$WORK/fresh" rev-parse --abbrev-ref HEAD)"

@@ -56,21 +56,23 @@ const (
 // ---------------------------------------------------------------------------
 
 type config struct {
-	root        string
-	remote      string
-	candidates  []string
-	jobs        int
-	dryRun      bool
-	autoResolve []string
-	mergeUptr   bool
-	push        bool
-	submodules  bool
-	recover     bool
-	listOnly    bool
-	verbose     bool
-	skipRE      *regexp.Regexp
-	maxDepth    int
-	timeout     time.Duration
+	root           string
+	remote         string
+	candidates     []string
+	jobs           int
+	dryRun         bool
+	autoResolve    []string
+	mergeUptr      bool
+	push           bool
+	submodules     bool
+	recover        bool
+	listOnly       bool
+	verbose        bool
+	switchDetached bool
+	skipSubmodules bool
+	skipRE         *regexp.Regexp
+	maxDepth       int
+	timeout        time.Duration
 }
 
 func (c *config) resolveStrategies() []string {
@@ -285,6 +287,16 @@ func (g git) currentBranch() string {
 		return name
 	}
 	return ""
+}
+
+// superproject returns the working tree of the repository that has this
+// repository as a submodule, or "" when it is a standalone repository.
+func (g git) superproject() string {
+	out, err := g.output("rev-parse", "--show-superproject-working-tree")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(out)
 }
 
 func (g git) upstreamOf(branch string) string {
@@ -543,6 +555,14 @@ func (s *syncer) syncOne(path string) result {
 		return res.skip(start, "no remote configured")
 	}
 
+	// The commit a submodule points at belongs to the parent repository, not
+	// to us: leave those repositories alone unless asked otherwise.
+	if s.cfg.skipSubmodules {
+		if super := g.superproject(); super != "" {
+			return res.skip(start, "submodule of "+filepath.Base(super)+"; skipped")
+		}
+	}
+
 	// --- 2. fetch -----------------------------------------------------------
 	fetchFailed := false
 	if err := g.mutate("fetch", "--prune", remote); err != nil {
@@ -620,6 +640,13 @@ func (s *syncer) syncOne(path string) result {
 	// --- 5. detached HEAD ---------------------------------------------------
 	if detached {
 		res.branch = "(detached)"
+		// A detached HEAD is how submodules (and pinned checkouts) are
+		// stored. Moving it changes the parent repository's pointer, so the
+		// default is to only fetch and report.
+		if !s.cfg.switchDetached {
+			sha, _ := g.output("rev-parse", "--short", "HEAD")
+			return res.skip(start, "detached HEAD at "+sha+"; fetched only")
+		}
 		if !g.isAncestor("HEAD", defRef) {
 			n, _ := g.output("rev-list", "--count", defRef+"..HEAD")
 			// The working tree was stashed above: put it back before giving up.
@@ -924,6 +951,8 @@ func main() {
 	flag.BoolVar(&cfg.mergeUptr, "merge-upstream", true, "also merge the branch's own upstream into the branch")
 	flag.BoolVar(&cfg.push, "push", false, "push the current branch to its upstream after syncing")
 	flag.BoolVar(&cfg.submodules, "submodules", false, "run 'git submodule update --init --recursive' after syncing")
+	flag.BoolVar(&cfg.skipSubmodules, "skip-submodules", false, "leave repositories that are submodules of another repository untouched")
+	flag.BoolVar(&cfg.switchDetached, "switch-detached", false, "move a detached HEAD to the default branch and sync it")
 	flag.BoolVar(&cfg.recover, "recover", false, "abort an unfinished merge/rebase and continue")
 	flag.BoolVar(&cfg.listOnly, "list", false, "list the repositories and exit")
 	flag.BoolVar(&cfg.verbose, "v", false, "verbose output")
@@ -1102,6 +1131,8 @@ Flags:
   -merge-upstream    also merge the branch's own upstream into the branch (default true)
   -push              push the current branch to its upstream after syncing
   -submodules        run "git submodule update --init --recursive" afterwards
+  -skip-submodules   leave repositories that are submodules of another repository untouched
+  -switch-detached   move a detached HEAD to the default branch and sync it
   -recover           abort an unfinished merge/rebase and continue
   -list              list the repositories and exit
   -maxdepth int      maximum directory depth to scan (0 = unlimited)
