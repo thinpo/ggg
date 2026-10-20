@@ -100,6 +100,13 @@ seed subparent; git clone -q "$REMOTE/subparent.git" "$WORK/subparent"
 git -C "$WORK/subparent" -c protocol.file.allow=always submodule add -q "$REMOTE/inner.git" sub 2>/dev/null
 git -C "$WORK/subparent" commit -q -m "add submodule" 2>/dev/null
 git -C "$WORK/subparent" -c protocol.file.allow=always submodule update --init -q 2>/dev/null
+# 15 parent whose only local change is a moved submodule pointer: git refuses
+#    to stash submodule pointers, so "git stash push" saves nothing.
+seed pointer; git clone -q "$REMOTE/pointer.git" "$WORK/pointer"
+git -C "$WORK/pointer" -c protocol.file.allow=always submodule add -q "$REMOTE/inner.git" sub 2>/dev/null
+git -C "$WORK/pointer" commit -q -m "add submodule" 2>/dev/null
+git -C "$WORK/pointer" -c protocol.file.allow=always submodule update --init -q 2>/dev/null
+git -C "$WORK/pointer/sub" commit -q --allow-empty -m "submodule moved" 2>/dev/null
 
 echo
 echo "== dry run =="
@@ -110,7 +117,8 @@ check "dry run changes nothing" "$before" "$after"
 
 echo
 echo "== sync =="
-(cd "$WORK" && NO_COLOR=1 "$GG" 2>&1 | tail -25)
+SYNC_OUT=$(cd "$WORK" && NO_COLOR=1 "$GG" 2>&1)
+echo "$SYNC_OUT" | tail -25
 
 echo
 echo "== skip-submodules =="
@@ -141,6 +149,10 @@ check "nested repo synced" "origin/main" "$(git -C "$WORK/outer/vendor/inner" re
 check "upstream remote used" "upstream/main" "$(git -C "$WORK/up" rev-parse --abbrev-ref '@{upstream}')"
 check "fresh repo initialised" "main" "$(git -C "$WORK/fresh" rev-parse --abbrev-ref HEAD)"
 check "fresh repo has commits" "1" "$(git -C "$WORK/fresh" rev-list --count HEAD)"
+check "nothing failed" "0" "$(echo "$SYNC_OUT" | grep -c '^FAIL')"
+check "pointer parent synced" "origin/main" "$(git -C "$WORK/pointer" rev-parse --abbrev-ref '@{upstream}')"
+check "pointer submodule kept" " M sub" "$(git -C "$WORK/pointer" status --porcelain | head -1)"
+check "pointer no stash left" "" "$(git -C "$WORK/pointer" stash list)"
 
 echo
 echo "passed: $pass  failed: $fail"

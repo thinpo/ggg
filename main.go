@@ -318,20 +318,39 @@ func (g git) isDirty() bool {
 	return strings.TrimSpace(out) != ""
 }
 
+// stashRef returns the SHA of the top of the stash stack, or "" when the
+// stack is empty.
+func (g git) stashRef() string {
+	sha, err := g.output("rev-parse", "--verify", "--quiet", "refs/stash")
+	if err != nil {
+		return ""
+	}
+	return sha
+}
+
 // stash pushes the working tree (including untracked files) onto the stash
 // stack and returns the SHA of the new stash entry.
+//
+// An empty SHA means "nothing was stashed": git does not record submodule
+// pointer changes, so a tree whose only modification is a moved submodule
+// stays dirty and produces no stash entry at all. git stash push still exits
+// successfully in that case, so this is not an error.
 func (g git) stash(message string) (string, error) {
+	before := g.stashRef()
 	if err := g.mutate("stash", "push", "--include-untracked", "-m", message); err != nil {
 		return "", err
 	}
 	if g.dryRun {
 		return "", nil
 	}
-	sha, err := g.output("rev-parse", "--verify", "--quiet", "refs/stash")
-	if err != nil {
-		return "", fmt.Errorf("could not identify the new stash entry")
+	after := g.stashRef()
+	if after == "" || after == before {
+		// No new entry: either there was nothing to stash or the stash stack
+		// was left untouched. Never guess - the old top of the stack is
+		// somebody else's stash and must not be applied or dropped.
+		return "", nil
 	}
-	return sha, nil
+	return after, nil
 }
 
 // restoreStash re-applies a stash entry and drops it only when the apply
@@ -634,6 +653,11 @@ func (s *syncer) syncOne(path string) result {
 		stashSHA = sha
 		if sha != "" {
 			res.note("stashed local changes as %s", shortSHA(sha))
+		} else if g.isDirty() {
+			// The tree is still dirty although the stash succeeded: the only
+			// thing left is submodule pointer movement, which git cannot
+			// stash. Those pointers are preserved on purpose.
+			res.note("local changes are submodule pointers only; kept in place (git cannot stash them)")
 		}
 	}
 
