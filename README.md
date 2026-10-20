@@ -48,6 +48,7 @@ cd ggg && make install        # installs into ~/local/bin/ggg
 | detached HEAD | fetched only and reported — the commit is not moved (`-switch-detached` opts in) |
 | stash pop conflicts | the stash is **kept** and the conflict is reported — nothing is lost |
 | remote repository is gone (deleted, renamed, no longer visible) | `.git` is renamed to `.git_old`, so the next run skips the directory |
+| the remote of a hidden repository is back | `.git_old` is renamed back to `.git` and the repository is synced again |
 
 Default branch detection order: `origin/HEAD` → `main` → `master` → first
 branch on the remote.
@@ -71,10 +72,25 @@ brought back at any time:
 mv repo/.git_old repo/.git
 ```
 
-Only a remote that is really gone triggers this. Authentication failures
+### Recovery
+
+`ggg` checks the remote of every hidden repository on each run. As soon as
+one answers again — the repository was re-created, renamed back, or access was
+restored — the metadata is renamed back and the repository is synced as usual:
+
+```
+RESTORE  old    remote origin is back; .git_old renamed back to .git
+HIDDEN   gone   the remote is still gone
+```
+
+A restored repository is a normal repository again: it is listed by `-list`,
+it is fetched, merged and fast-forwarded like any other one.
+
+Only a remote that is really gone triggers the hiding. Authentication failures
 (`Permission denied`, `could not read Username`) and network problems
 (`Could not resolve host`) leave the repository alone: it is still alive and
-keeps being synced.
+keeps being synced. The same is true for the recovery check: a remote that
+cannot be reached is not treated as recovered.
 
 ## Safety rules
 
@@ -124,10 +140,12 @@ first parent of the merge commit.
 ```
 ggg 1.0.0 — syncing 5 repositories under /home/me/src
 
+RESTORE old    remote origin is back; .git_old renamed back to .git
+HIDDEN  gone   the remote is still gone
+
 OK   alpha  fast-forward to origin/main
 WARN beta   stash apply conflicted (stash kept: 305f50b7)
 SKIP noremote  no remote configured
-SKIP old    remote repository is gone; renamed .git to .git_old
 
 ────────────────────────────────────────────────────────────────────────
 OK    alpha     main        fast-forward to origin/main
@@ -155,7 +173,8 @@ Exit code is `1` only when a repository actually failed.
 * `node_modules`, `venv`, `__pycache__` and similar directories are skipped by
   default; use `-skip` to add your own patterns.
 * `.git_old` directories are skipped as well, so a repository whose remote is
-  gone is not descended into.
+  gone is not descended into — but they are checked, and restored as soon as
+  their remote answers again.
 * Symlinked directories are not followed.
 * The scan reads the working tree only; it never rewrites history.
 

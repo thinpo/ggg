@@ -115,6 +115,10 @@ git -C "$WORK/pointer/sub" commit -q --allow-empty -m "submodule moved" 2>/dev/n
 #    the git metadata to .git_old and the next run skips the directory.
 seed vanished; git clone -q "$REMOTE/vanished.git" "$WORK/vanished"
 rm -rf "$REMOTE/vanished.git"
+# 17 a repository whose remote disappears for a while and comes back: ggg
+#    restores .git from .git_old and syncs the repository again.
+seed reborn; git clone -q "$REMOTE/reborn.git" "$WORK/reborn"
+mv "$REMOTE/reborn.git" "$BASE/reborn-away.git"
 
 echo
 echo "== dry run =="
@@ -133,6 +137,13 @@ echo "== skip-submodules =="
 out=$(cd "$WORK" && NO_COLOR=1 "$GG" -skip-submodules 2>&1)
 check "submodule reported as skipped" "yes" \
   "$(echo "$out" | grep -q 'submodule of subparent; skipped' && echo yes || echo no)"
+
+echo
+echo "== recovery =="
+# The remote of "reborn" comes back, with a new commit on top.
+mv "$BASE/reborn-away.git" "$REMOTE/reborn.git"
+remote_commit reborn
+(cd "$WORK" && NO_COLOR=1 "$GG" 2>&1 | grep -E 'RESTORE|HIDDEN' || true)
 
 echo
 echo "== checks =="
@@ -166,6 +177,15 @@ check "gone remote kept as .git_old" "yes" "$([ -d "$WORK/vanished/.git_old" ] &
 check "gone remote history intact" "init" "$(git --git-dir="$WORK/vanished/.git_old" log --oneline -1 | cut -d' ' -f2-)"
 check "gone remote skipped next run" "no" \
   "$(cd "$WORK" && NO_COLOR=1 "$GG" -list | grep -q 'vanished' && echo yes || echo no)"
+check "still gone repo stays hidden" "yes" "$([ -d "$WORK/vanished/.git_old" ] && echo yes || echo no)"
+check "recovered repo restored" "yes" "$([ -d "$WORK/reborn/.git" ] && echo yes || echo no)"
+check "recovered repo has no .git_old" "no" "$([ -e "$WORK/reborn/.git_old" ] && echo yes || echo no)"
+check "recovered repo synced" "$(git -C "$WORK/reborn" rev-parse origin/main)" \
+  "$(git -C "$WORK/reborn" rev-parse HEAD)"
+check "recovered repo got the new commit" "1" \
+  "$(grep -c 'remote change' "$WORK/reborn/keep.txt")"
+check "recovered repo in the sync list" "yes" \
+  "$(cd "$WORK" && NO_COLOR=1 "$GG" -list | grep -q 'reborn' && echo yes || echo no)"
 
 echo
 echo "passed: $pass  failed: $fail"

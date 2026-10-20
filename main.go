@@ -13,8 +13,8 @@
 //  2. Fetches the remote with --prune. If the remote repository itself is
 //     gone (deleted, renamed, no longer visible), the git metadata is renamed
 //     to .git_old so the next run skips that directory instead of failing
-//     again. Nothing is deleted: renaming .git_old back restores the
-//     repository.
+//     again. Nothing is deleted: when the remote comes back, .git_old is
+//     renamed back to .git and the repository is synced as usual.
 //  3. If the working tree is dirty, stashes it (including untracked files)
 //     before touching history and pops it afterwards.
 //  4. On the default branch (main/master): fast-forwards when possible, and
@@ -54,7 +54,7 @@ const progName = "ggg"
 
 // version is the release version. It is overridden at build time with
 // -ldflags "-X main.version=1.2.3".
-var version = "1.1.0"
+var version = "1.2.0"
 
 // ---------------------------------------------------------------------------
 // configuration
@@ -136,6 +136,13 @@ func (r *result) note(format string, args ...any) {
 	r.details = append(r.details, fmt.Sprintf(format, args...))
 }
 
+// restoreResult describes what happened to a hidden repository.
+type restoreResult struct {
+	path     string
+	restored bool
+	summary  string
+}
+
 // ---------------------------------------------------------------------------
 // git plumbing
 // ---------------------------------------------------------------------------
@@ -146,13 +153,26 @@ type git struct {
 	dryRun  bool
 	mu      *sync.Mutex
 	log     func(string)
+	// gitDirOverride runs the commands against this git directory instead
+	// of the one in dir. It is used for the metadata of a hidden
+	// repository, which is not reachable as a repository any more.
+	gitDirOverride string
+}
+
+// prefix returns the git options that select the repository.
+func (g git) prefix() []string {
+	p := []string{"-C", g.dir}
+	if g.gitDirOverride != "" {
+		p = append(p, "--git-dir", g.gitDirOverride)
+	}
+	return p
 }
 
 func (g git) run(args ...string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), g.timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", g.dir}, args...)...)
+	cmd := exec.CommandContext(ctx, "git", append(g.prefix(), args...)...)
 	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "LC_ALL=C")
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -190,7 +210,7 @@ func (g git) output(args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), g.timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", g.dir}, args...)...)
+	cmd := exec.CommandContext(ctx, "git", append(g.prefix(), args...)...)
 	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "LC_ALL=C")
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -501,6 +521,85 @@ func hideGitDir(path string) (string, error) {
 	return dst, nil
 }
 
+// hiddenGitDir returns the git directory the hidden metadata points at.
+//
+// For a normal clone that is the .git_old directory itself. For a worktree or
+// a submodule the .git_old file points at the real git directory.
+func hiddenGitDir(path, old string, st os.FileInfo) (string, error) {
+	if st.IsDir() {
+		abs, err := filepath.Abs(old)
+		if err != nil {
+			return "", err
+		}
+		return abs, nil
+	}
+	data, err := os.ReadFile(old)
+	if err != nil {
+		return "", fmt.Errorf("cannot read .git_old: %w", err)
+	}
+	line := strings.TrimSpace(string(data))
+	if !strings.HasPrefix(line, "gitdir:") {
+		return "", fmt.Errorf("unexpected .git_old content: %q", line)
+	}
+	dir := strings.TrimSpace(strings.TrimPrefix(line, "gitdir:"))
+	if !filepath.IsAbs(dir) {
+		dir = filepath.Join(path, dir)
+	}
+	if _, err := os.Stat(dir); err != nil {
+		return "", fmt.Errorf("the git directory %s is gone", dir)
+	}
+	return dir, nil
+}
+
+// restoreHidden brings a hidden repository back when its remote answers
+// again.
+//
+// The .git_old metadata is renamed back to .git and the repository is synced
+// like any other one. Nothing happens while the remote is still gone or
+// cannot be reached: the repository stays hidden.
+func (s *syncer) restoreHidden(path string) (bool, string) {
+	old := filepath.Join(path, ".git_old")
+	st, err := os.Lstat(old)
+	if err != nil {
+		return false, "cannot read .git_old: " + err.Error()
+	}
+	gitDir, err := hiddenGitDir(path, old, st)
+	if err != nil {
+		return false, err.Error()
+	}
+
+	g := git{
+		dir:            path,
+		gitDirOverride: gitDir,
+		timeout:        s.cfg.timeout,
+		dryRun:         s.cfg.dryRun,
+	}
+	remotes := g.remotes()
+	if len(remotes) == 0 {
+		return false, "no remote configured"
+	}
+
+	// The repository is back as soon as one of its remotes answers again.
+	var lastErr error
+	for _, r := range remotes {
+		lastErr = g.run("ls-remote", r)
+		if lastErr != nil {
+			continue
+		}
+		if s.cfg.dryRun {
+			return false, "remote " + r + " is back; would rename .git_old back to .git and sync it"
+		}
+		if err := os.Rename(old, filepath.Join(path, ".git")); err != nil {
+			return false, "could not rename .git_old back to .git: " + err.Error()
+		}
+		return true, "remote " + r + " is back; .git_old renamed back to .git"
+	}
+	if isGoneRemote(lastErr) {
+		return false, "the remote is still gone"
+	}
+	return false, "the remote could not be reached: " + lastErr.Error()
+}
+
 // ---------------------------------------------------------------------------
 // discovery
 // ---------------------------------------------------------------------------
@@ -533,20 +632,60 @@ func isRepoDir(dir string) bool {
 	return st.IsDir() || st.Mode().IsRegular()
 }
 
-func findRepos(root string, cfg config) ([]string, error) {
+// hasGitOld reports whether dir holds the metadata of a hidden repository: a
+// .git_old without a .git.
+func hasGitOld(dir string) bool {
+	st, err := os.Lstat(filepath.Join(dir, ".git_old"))
+	if err != nil {
+		return false
+	}
+	return st.IsDir() || st.Mode().IsRegular()
+}
+
+// skipWalkDir reports whether the walk must not descend into path.
+func skipWalkDir(path, root string, d fs.DirEntry, cfg config) bool {
+	if path == root {
+		return false
+	}
+	name := d.Name()
+	if defaultSkipDirs[name] {
+		return true
+	}
+	// The metadata of a hidden repository and the archived copies of it.
+	if strings.HasPrefix(name, ".git_old") {
+		return true
+	}
+	if cfg.skipRE != nil && cfg.skipRE.MatchString(path) {
+		return true
+	}
+	if cfg.maxDepth > 0 {
+		rel, err := filepath.Rel(root, path)
+		if err == nil {
+			depth := len(strings.Split(rel, string(os.PathSeparator)))
+			if depth > cfg.maxDepth {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// scan walks the tree once and returns the git repositories it finds plus the
+// hidden ones: directories that hold a .git_old but no .git, i.e. repositories
+// whose remote was gone.
+func scan(root string, cfg config) (repos, hidden []string, err error) {
 	abs, err := filepath.Abs(root)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	info, err := os.Stat(abs)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if !info.IsDir() {
 		abs = filepath.Dir(abs)
 	}
 
-	var repos []string
 	walkErr := filepath.WalkDir(abs, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			// Unreadable directory: skip it rather than aborting the scan.
@@ -558,33 +697,23 @@ func findRepos(root string, cfg config) ([]string, error) {
 		if !d.IsDir() {
 			return nil
 		}
-		if path != abs {
-			if defaultSkipDirs[d.Name()] {
-				return fs.SkipDir
-			}
-			if cfg.skipRE != nil && cfg.skipRE.MatchString(path) {
-				return fs.SkipDir
-			}
-			if cfg.maxDepth > 0 {
-				rel, rerr := filepath.Rel(abs, path)
-				if rerr == nil {
-					depth := len(strings.Split(rel, string(os.PathSeparator)))
-					if depth > cfg.maxDepth {
-						return fs.SkipDir
-					}
-				}
-			}
+		if skipWalkDir(path, abs, d, cfg) {
+			return fs.SkipDir
 		}
-		if isRepoDir(path) {
+		switch {
+		case isRepoDir(path):
 			repos = append(repos, path)
+		case hasGitOld(path):
+			hidden = append(hidden, path)
 		}
 		return nil
 	})
 	if walkErr != nil {
-		return repos, walkErr
+		return repos, hidden, walkErr
 	}
 	sort.Strings(repos)
-	return repos, nil
+	sort.Strings(hidden)
+	return repos, hidden, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -1134,19 +1263,33 @@ func main() {
 	// the scan root.
 	cfg.root = root
 
-	repos, err := findRepos(root, cfg)
+	s := &syncer{cfg: cfg}
+
+	repos, hidden, err := scan(root, cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%s: %v\n", progName, err)
 	}
-	if len(repos) == 0 {
-		fmt.Printf("%s: no git repositories found under %s\n", progName, root)
-		return
-	}
-
 	if cfg.listOnly {
 		for _, r := range repos {
 			fmt.Println(r)
 		}
+		return
+	}
+
+	// A hidden repository whose remote is back gets its .git back and is
+	// synced like any other repository.
+	var restores []restoreResult
+	for _, h := range hidden {
+		ok, summary := s.restoreHidden(h)
+		restores = append(restores, restoreResult{path: h, restored: ok, summary: summary})
+		if ok {
+			repos = append(repos, h)
+		}
+	}
+	sort.Strings(repos)
+
+	if len(repos) == 0 {
+		fmt.Printf("%s: no git repositories found under %s\n", progName, root)
 		return
 	}
 
@@ -1157,7 +1300,17 @@ func main() {
 	}
 	fmt.Println()
 
-	s := &syncer{cfg: cfg}
+	for _, r := range restores {
+		tag := paint("90", "HIDDEN")
+		if r.restored {
+			tag = paint("32", "RESTORE")
+		}
+		fmt.Printf("%s %s  %s\n", tag, indent(r.path, root), r.summary)
+	}
+	if len(restores) > 0 {
+		fmt.Println()
+	}
+
 	results := s.runAll(repos)
 
 	if cfg.dryRun {

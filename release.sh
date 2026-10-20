@@ -87,6 +87,8 @@ Find every git repository under a directory and sync each one with its remote.
   to \`main\` and the feature branch is kept intact
 - a remote that is really gone is renamed \`.git\` → \`.git_old\`, so the next run
   skips that directory instead of failing again (nothing is deleted)
+- when that remote comes back, \`.git_old\` is renamed back to \`.git\` and the
+  repository is synced again
 - never force-pushes, never \`reset --hard\`, never drops a stash
 
 \`\`\`sh
