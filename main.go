@@ -11,10 +11,9 @@
 //  1. Detects an unfinished merge/rebase/cherry-pick and refuses to touch the
 //     repository (or aborts it with -recover).
 //  2. Fetches the remote with --prune. If the remote repository itself is
-//     gone (deleted, renamed, no longer visible), the git metadata is renamed
-//     to .git_old so the next run skips that directory instead of failing
-//     again. Nothing is deleted: when the remote comes back, .git_old is
-//     renamed back to .git and the repository is synced as usual.
+//     gone (deleted, renamed, no longer visible), the local copy is all that
+//     is left: the repository is reported as local-only and left completely
+//     untouched - nothing is synced into it and nothing is renamed.
 //  3. If the working tree is dirty, stashes it (including untracked files)
 //     before touching history and pops it afterwards.
 //  4. On the default branch (main/master): fast-forwards when possible, and
@@ -54,7 +53,7 @@ const progName = "ggg"
 
 // version is the release version. It is overridden at build time with
 // -ldflags "-X main.version=1.2.3".
-var version = "1.2.0"
+var version = "1.3.0"
 
 // ---------------------------------------------------------------------------
 // configuration
@@ -458,7 +457,7 @@ func (g git) defaultBranch(remote string, candidates []string) string {
 }
 
 // ---------------------------------------------------------------------------
-// gone remotes
+// gone remotes and hidden repositories
 // ---------------------------------------------------------------------------
 
 // goneRemotePhrases are the error fragments git prints when the remote
@@ -494,31 +493,6 @@ func isGoneRemote(err error) bool {
 		return true
 	}
 	return false
-}
-
-// hideGitDir renames the repository metadata from .git to .git_old so the
-// directory stops being recognised as a git repository: the next scan skips
-// it instead of failing again.
-//
-// Nothing is lost. The objects, the refs and the whole history stay in
-// .git_old, and renaming it back restores the repository.
-func hideGitDir(path string) (string, error) {
-	src := filepath.Join(path, ".git")
-	if _, err := os.Lstat(src); err != nil {
-		return "", err
-	}
-	dst := filepath.Join(path, ".git_old")
-	if _, err := os.Lstat(dst); err == nil {
-		// Never overwrite an earlier .git_old: move it aside first.
-		aside := fmt.Sprintf("%s.%s", dst, time.Now().Format("20060102-150405"))
-		if err := os.Rename(dst, aside); err != nil {
-			return "", fmt.Errorf("could not move the existing .git_old aside: %w", err)
-		}
-	}
-	if err := os.Rename(src, dst); err != nil {
-		return "", err
-	}
-	return dst, nil
 }
 
 // hiddenGitDir returns the git directory the hidden metadata points at.
@@ -557,6 +531,10 @@ func hiddenGitDir(path, old string, st os.FileInfo) (string, error) {
 // The .git_old metadata is renamed back to .git and the repository is synced
 // like any other one. Nothing happens while the remote is still gone or
 // cannot be reached: the repository stays hidden.
+//
+// Hidden repositories are a leftover of ggg 1.1, which renamed the metadata of
+// a repository whose remote was gone. ggg does not hide anything any more: a
+// repository whose remote is gone stays a normal, local-only repository.
 func (s *syncer) restoreHidden(path string) (bool, string) {
 	old := filepath.Join(path, ".git_old")
 	st, err := os.Lstat(old)
@@ -788,7 +766,7 @@ func (s *syncer) syncOne(path string) result {
 		// read-only ls-remote: the plan has to know whether the remote is
 		// still there.
 		if _, err := g.output("ls-remote", "--exit-code", remote); err != nil && isGoneRemote(err) {
-			return s.handleGoneRemote(path, start, &res, err)
+			return s.localOnly(start, &res, err)
 		}
 	}
 	if err := g.mutate("fetch", "--prune", remote); err != nil {
@@ -796,10 +774,10 @@ func (s *syncer) syncOne(path string) result {
 		res.st = statusWarn
 		res.note("fetch failed: %v", err)
 		if isGoneRemote(err) {
-			// The remote repository itself is gone. Move the git metadata
-			// out of the way so that the next scan skips this directory
-			// instead of failing on it again.
-			return s.handleGoneRemote(path, start, &res, err)
+			// The remote repository itself is gone: the local copy is the
+			// only one that is left. Nothing is synced and nothing is
+			// changed - the repository is left exactly as it is.
+			return s.localOnly(start, &res, err)
 		}
 	}
 
@@ -943,28 +921,17 @@ func (s *syncer) syncOne(path string) result {
 	return res.finish(start)
 }
 
-// handleGoneRemote reacts to a remote repository that no longer exists.
+// localOnly reports a repository whose remote repository no longer exists.
 //
-// The git metadata is renamed to .git_old: the directory keeps all of its
-// files and history, but it is no longer a git repository, so the next scan
-// skips it.
-func (s *syncer) handleGoneRemote(path string, start time.Time, res *result, fetchErr error) result {
-	res.st = statusSkip
-	res.summary = "remote repository is gone"
+// The local copy is the only one that is left, so there is nothing to sync:
+// the repository is left exactly as it is - no fetch into it, no merge, no
+// push and no renaming of its metadata. A repository that is local-only stays
+// a normal repository, so it is still listed and it is still synced as soon as
+// its remote is back.
+func (s *syncer) localOnly(start time.Time, res *result, fetchErr error) result {
 	res.note("%v", fetchErr)
-	if s.cfg.dryRun {
-		res.summary += "; would rename .git to .git_old"
-		return res.finish(start)
-	}
-	dst, err := hideGitDir(path)
-	if err != nil {
-		res.st = statusWarn
-		res.summary = "remote repository is gone; could not rename .git: " + err.Error()
-		return res.finish(start)
-	}
-	res.summary = "remote repository is gone; renamed .git to " + filepath.Base(dst)
-	res.note("rename %s back to .git to bring the repository back", filepath.Base(dst))
-	return res.finish(start)
+	res.note("nothing was synced and nothing was changed")
+	return res.skip(start, "remote repository is gone; only the local copy is left")
 }
 
 // resolveRemote picks the remote to sync from.

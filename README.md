@@ -47,36 +47,40 @@ cd ggg && make install        # installs into ~/local/bin/ggg
 | merge still conflicts | aborts, keeps the feature branch and its local commits, switches to `main`/`master` and syncs that instead |
 | detached HEAD | fetched only and reported — the commit is not moved (`-switch-detached` opts in) |
 | stash pop conflicts | the stash is **kept** and the conflict is reported — nothing is lost |
-| remote repository is gone (deleted, renamed, no longer visible) | `.git` is renamed to `.git_old`, so the next run skips the directory |
-| the remote of a hidden repository is back | `.git_old` is renamed back to `.git` and the repository is synced again |
+| remote repository is gone (deleted, renamed, no longer visible) | the local copy is all that is left: the repository is skipped and left completely untouched — nothing is synced, nothing is renamed |
+| the remote of a repository hidden by ggg 1.1 is back | `.git_old` is renamed back to `.git` and the repository is synced again |
 
 Default branch detection order: `origin/HEAD` → `main` → `master` → first
 branch on the remote.
 
-## Gone remotes
+## Local-only repositories
 
-When a remote repository no longer exists — it was deleted, renamed, or it is
-not visible to this user any more — `ggg` does not keep failing on it. It
-renames the git metadata:
+A remote repository can disappear: it was deleted, renamed, or it is not
+visible to this user any more. When that happens the local copy is all that
+is left, so there is nothing to sync — `ggg` leaves such a repository alone:
 
 ```
-repo/.git  →  repo/.git_old
+SKIP  old    remote repository is gone; only the local copy is left
 ```
 
-The directory keeps **all** of its files and the **whole** history; it simply
-is not a git repository any more, so the next scan skips it instead of
-reporting the same error again. Nothing is deleted, and the repository can be
-brought back at any time:
+Nothing is fetched into it, nothing is merged, nothing is pushed, and its
+metadata is not renamed. The directory stays exactly as it is, with its whole
+history and its local work. It is still listed by `-list`, and it is synced
+again as soon as its remote is back.
 
-```sh
-mv repo/.git_old repo/.git
-```
+Only a remote that is really gone is reported like this. Authentication
+failures (`Permission denied`, `could not read Username`) and network problems
+(`Could not resolve host`) leave the repository alone too: it is still alive
+and keeps being synced.
 
-### Recovery
+### Repositories hidden by ggg 1.1
 
-`ggg` checks the remote of every hidden repository on each run. As soon as
-one answers again — the repository was re-created, renamed back, or access was
-restored — the metadata is renamed back and the repository is synced as usual:
+ggg 1.1 renamed the metadata of a repository whose remote was gone to
+`.git_old`, so the directory stopped being a repository. `ggg` does not hide
+anything any more, but it still brings those repositories back: the remote of
+every hidden repository is checked on each run, and as soon as one answers
+again, `.git_old` is renamed back to `.git` and the repository is synced like
+any other one.
 
 ```
 RESTORE  old    remote origin is back; .git_old renamed back to .git
@@ -84,13 +88,12 @@ HIDDEN   gone   the remote is still gone
 ```
 
 A restored repository is a normal repository again: it is listed by `-list`,
-it is fetched, merged and fast-forwarded like any other one.
+it is fetched, merged and fast-forwarded like any other one. One can also be
+brought back by hand:
 
-Only a remote that is really gone triggers the hiding. Authentication failures
-(`Permission denied`, `could not read Username`) and network problems
-(`Could not resolve host`) leave the repository alone: it is still alive and
-keeps being synced. The same is true for the recovery check: a remote that
-cannot be reached is not treated as recovered.
+```sh
+mv repo/.git_old repo/.git
+```
 
 ## Safety rules
 
@@ -98,7 +101,8 @@ cannot be reached is not treated as recovered.
 * Never `reset --hard` — a repository that has no commits yet is simply
   pointed at the remote branch instead.
 * Never drops a stash that did not apply cleanly.
-* Never deletes a repository — a gone remote only renames `.git` to `.git_old`.
+* Never deletes or renames a repository — a gone remote is only reported, and
+  the local copy is left exactly as it is.
 * Only ever creates merge commits — local history is never rewritten.
 
 ## Flags
@@ -138,7 +142,7 @@ first parent of the merge commit.
 ## Output
 
 ```
-ggg 1.0.0 — syncing 5 repositories under /home/me/src
+ggg 1.3.0 — syncing 5 repositories under /home/me/src
 
 RESTORE old    remote origin is back; .git_old renamed back to .git
 HIDDEN  gone   the remote is still gone
@@ -146,12 +150,13 @@ HIDDEN  gone   the remote is still gone
 OK   alpha  fast-forward to origin/main
 WARN beta   stash apply conflicted (stash kept: 305f50b7)
 SKIP noremote  no remote configured
+SKIP old    remote repository is gone; only the local copy is left
 
 ────────────────────────────────────────────────────────────────────────
 OK    alpha     main        fast-forward to origin/main
 WARN  beta      main        stash apply conflicted (stash kept: 305f50b7)
 SKIP  noremote  -           no remote configured
-SKIP  old       -           remote repository is gone; renamed .git to .git_old
+SKIP  old       -           remote repository is gone; only the local copy is left
 ────────────────────────────────────────────────────────────────────────
 OK 2   WARN 1   FAIL 0   SKIP 2   (5 total)
 ```
@@ -172,8 +177,8 @@ Exit code is `1` only when a repository actually failed.
   syncing means.
 * `node_modules`, `venv`, `__pycache__` and similar directories are skipped by
   default; use `-skip` to add your own patterns.
-* `.git_old` directories are skipped as well, so a repository whose remote is
-  gone is not descended into — but they are checked, and restored as soon as
+* `.git_old` directories are skipped as well, so a repository that ggg 1.1
+  hid is not descended into — but they are checked, and restored as soon as
   their remote answers again.
 * Symlinked directories are not followed.
 * The scan reads the working tree only; it never rewrites history.
@@ -183,8 +188,9 @@ Exit code is `1` only when a repository actually failed.
 `test.sh` builds throw-away remotes and clones covering every branch of the
 algorithm (fast-forward, dirty tree, feature branch, conflicting feature
 branch, diverged main, `master` remote, unfinished merge, detached HEAD,
-nested repo, non-`origin` remote, repository without commits, deleted remote)
-and asserts the resulting state:
+nested repo, non-`origin` remote, repository without commits, deleted remote
+→ local-only repository, repository hidden by ggg 1.1 and restored) and asserts
+the resulting state:
 
 ```
 ./test.sh          # builds ./ggg first if needed

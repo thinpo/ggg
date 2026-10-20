@@ -111,14 +111,16 @@ git -C "$WORK/pointer" -c protocol.file.allow=always submodule add -q "$REMOTE/i
 git -C "$WORK/pointer" commit -q -m "add submodule" 2>/dev/null
 git -C "$WORK/pointer" -c protocol.file.allow=always submodule update --init -q 2>/dev/null
 git -C "$WORK/pointer/sub" commit -q --allow-empty -m "submodule moved" 2>/dev/null
-# 16 a repository whose remote was deleted: the remote is gone, so ggg moves
-#    the git metadata to .git_old and the next run skips the directory.
+# 16 a repository whose remote was deleted: only the local copy is left, so
+#    ggg does not sync it and does not touch it.
 seed vanished; git clone -q "$REMOTE/vanished.git" "$WORK/vanished"
 rm -rf "$REMOTE/vanished.git"
-# 17 a repository whose remote disappears for a while and comes back: ggg
-#    restores .git from .git_old and syncs the repository again.
+echo "local work" >> "$WORK/vanished/file.txt"
+# 17 a repository hidden by ggg 1.1 (its metadata sits in .git_old) whose
+#    remote comes back: ggg restores .git from .git_old and syncs it again.
 seed reborn; git clone -q "$REMOTE/reborn.git" "$WORK/reborn"
 mv "$REMOTE/reborn.git" "$BASE/reborn-away.git"
+mv "$WORK/reborn/.git" "$WORK/reborn/.git_old"
 
 echo
 echo "== dry run =="
@@ -172,12 +174,15 @@ check "nothing failed" "0" "$(echo "$SYNC_OUT" | grep -c '^FAIL')"
 check "pointer parent synced" "origin/main" "$(git -C "$WORK/pointer" rev-parse --abbrev-ref '@{upstream}')"
 check "pointer submodule kept" " M sub" "$(git -C "$WORK/pointer" status --porcelain | head -1)"
 check "pointer no stash left" "" "$(git -C "$WORK/pointer" stash list)"
-check "gone remote renamed .git" "no" "$([ -e "$WORK/vanished/.git" ] && echo yes || echo no)"
-check "gone remote kept as .git_old" "yes" "$([ -d "$WORK/vanished/.git_old" ] && echo yes || echo no)"
-check "gone remote history intact" "init" "$(git --git-dir="$WORK/vanished/.git_old" log --oneline -1 | cut -d' ' -f2-)"
-check "gone remote skipped next run" "no" \
+check "gone remote left untouched" "yes" "$([ -d "$WORK/vanished/.git" ] && echo yes || echo no)"
+check "gone remote not hidden" "no" "$([ -e "$WORK/vanished/.git_old" ] && echo yes || echo no)"
+check "gone remote history intact" "init" "$(git -C "$WORK/vanished" log --oneline -1 | cut -d' ' -f2-)"
+check "gone remote keeps local work" " M file.txt" "$(git -C "$WORK/vanished" status --porcelain | head -1)"
+check "gone remote not synced" "yes" \
+  "$(echo "$SYNC_OUT" | grep 'vanished' | grep -q 'only the local copy is left' && echo yes || echo no)"
+check "gone remote still listed" "yes" \
   "$(cd "$WORK" && NO_COLOR=1 "$GG" -list | grep -q 'vanished' && echo yes || echo no)"
-check "still gone repo stays hidden" "yes" "$([ -d "$WORK/vanished/.git_old" ] && echo yes || echo no)"
+check "gone remote left alone next run" "yes" "$([ -d "$WORK/vanished/.git" ] && echo yes || echo no)"
 check "recovered repo restored" "yes" "$([ -d "$WORK/reborn/.git" ] && echo yes || echo no)"
 check "recovered repo has no .git_old" "no" "$([ -e "$WORK/reborn/.git_old" ] && echo yes || echo no)"
 check "recovered repo synced" "$(git -C "$WORK/reborn" rev-parse origin/main)" \

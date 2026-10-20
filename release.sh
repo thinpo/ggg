@@ -85,10 +85,9 @@ Find every git repository under a directory and sync each one with its remote.
 - feature branches get their upstream and \`origin/main\` merged in
 - conflicts are auto-resolved with \`-X theirs\`; unresolvable merges fall back
   to \`main\` and the feature branch is kept intact
-- a remote that is really gone is renamed \`.git\` → \`.git_old\`, so the next run
-  skips that directory instead of failing again (nothing is deleted)
-- when that remote comes back, \`.git_old\` is renamed back to \`.git\` and the
-  repository is synced again
+- a remote that is really gone is reported as a local-only repository and
+  left completely untouched: nothing is synced, nothing is renamed
+- a repository hidden by ggg 1.1 is restored when its remote comes back
 - never force-pushes, never \`reset --hard\`, never drops a stash
 
 \`\`\`sh
