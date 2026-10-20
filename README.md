@@ -20,7 +20,7 @@ Download the archive for your platform from the
 [releases page](https://github.com/thinpo/ggg/releases):
 
 ```sh
-tar xzf ggg-darwin-arm64_1.0.0.tar.gz
+tar xzf ggg-darwin-arm64_<version>.tar.gz
 mv ggg-darwin-arm64 ~/local/bin/ggg
 ```
 

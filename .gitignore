@@ -1,2 +1,5 @@
 # Built binary
 /ggg
+
+# Release artifacts
+/dist/

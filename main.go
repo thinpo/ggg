@@ -50,7 +50,7 @@ const progName = "ggg"
 
 // version is the release version. It is overridden at build time with
 // -ldflags "-X main.version=1.2.3".
-var version = "1.0.0"
+var version = "1.0.1"
 
 // ---------------------------------------------------------------------------
 // configuration
@@ -654,7 +654,7 @@ func (s *syncer) syncOne(path string) result {
 		stashSHA = sha
 		if sha != "" {
 			res.note("stashed local changes as %s", shortSHA(sha))
-		} else if g.isDirty() {
+		} else if g.isDirty() && !g.dryRun {
 			// The tree is still dirty although the stash succeeded: the only
 			// thing left is submodule pointer movement, which git cannot
 			// stash. Those pointers are preserved on purpose.
