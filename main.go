@@ -57,7 +57,7 @@ const progName = "ggg"
 
 // version is the release version. It is overridden at build time with
 // -ldflags "-X main.version=1.2.3".
-var version = "1.5.0"
+var version = "1.6.0"
 
 // ---------------------------------------------------------------------------
 // configuration
@@ -86,6 +86,8 @@ type config struct {
 	skipRE   *regexp.Regexp
 	maxDepth int
 	timeout  time.Duration
+	// followSymlinks makes the scan walk symlinked directories too.
+	followSymlinks bool
 }
 
 func (c *config) resolveStrategies() []string {
@@ -727,6 +729,32 @@ var defaultSkipDirs = map[string]bool{
 	".vscode":       true,
 }
 
+// reportEmpty explains that no repository was found, and what was not
+// looked at, so that an empty result is not a dead end.
+//
+// The message goes to stderr: the list of repositories stays readable.
+func reportEmpty(root string, cfg config) {
+	fmt.Fprintf(os.Stderr, "%s: no git repositories found under %s\n", progName, root)
+	if !cfg.followSymlinks {
+		fmt.Fprintf(os.Stderr, "%s: symlinked directories are not walked (use -follow-symlinks)\n", progName)
+	}
+	fmt.Fprintf(os.Stderr, "%s: %s and similar directories are skipped\n", progName, strings.Join(skipDirNames(), ", "))
+}
+
+// skipDirNames lists the directory names that are not walked, for the
+// message that explains an empty result.
+func skipDirNames() []string {
+	names := make([]string, 0, len(defaultSkipDirs))
+	for name := range defaultSkipDirs {
+		if name == ".git" || name == ".git_old" {
+			continue
+		}
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
 // isRepoDir reports whether dir is the top level of a git repository.
 func isRepoDir(dir string) bool {
 	st, err := os.Stat(filepath.Join(dir, ".git"))
@@ -766,6 +794,84 @@ func isBareRepository(dir string, timeout time.Duration) bool {
 	g := git{dir: dir, timeout: timeout}
 	out, err := g.output("rev-parse", "--is-bare-repository")
 	return err == nil && strings.TrimSpace(out) == "true"
+}
+
+// walker walks a directory tree and calls fn for every directory it finds.
+//
+// A symlinked directory is walked only when follow is set. The walk keeps
+// track of the directories it has already been in - by their real path, so
+// that a symlink leading back into the tree, or to a directory that was
+// walked already, cannot send it into a loop and cannot make it report the
+// same repository twice.
+type walker struct {
+	follow bool
+	seen   map[string]bool
+	// root is the directory the walk started in, rootReal its real path.
+	root     string
+	rootReal string
+}
+
+// realPath returns the real path of a directory below base.
+//
+// base is the real path of the directory the walk is in, so the real path of
+// a directory below it is the base and its name: no symbolic link is
+// resolved, which keeps the walk cheap.
+func realPath(base, name string) string {
+	return filepath.Join(base, name)
+}
+
+// walk calls fn for the directory dir and for every directory below it.
+//
+// fn is called with the path of the directory and the entry it was found
+// as. It can return fs.SkipDir to keep the walk from descending into it.
+func (w *walker) walk(dir, realBase string, fn func(path string, d fs.DirEntry) error) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		// Unreadable directory: skip it rather than aborting the scan.
+		return nil
+	}
+	for _, e := range entries {
+		path := filepath.Join(dir, e.Name())
+		switch {
+		case e.IsDir():
+			real := realPath(realBase, e.Name())
+			if w.seen[real] {
+				continue
+			}
+			w.seen[real] = true
+			if err := fn(path, e); err != nil {
+				if err == fs.SkipDir {
+					continue
+				}
+				return err
+			}
+			if err := w.walk(path, real, fn); err != nil {
+				return err
+			}
+		case e.Type()&fs.ModeSymlink != 0 && w.follow:
+			// A symlink to a directory: walk it, unless it leads somewhere
+			// the walk has been already.
+			info, err := os.Stat(path)
+			if err != nil || !info.IsDir() {
+				continue
+			}
+			real := canonical(path)
+			if w.seen[real] {
+				continue
+			}
+			w.seen[real] = true
+			if err := fn(path, e); err != nil {
+				if err == fs.SkipDir {
+					continue
+				}
+				return err
+			}
+			if err := w.walk(path, real, fn); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // hasGitOld reports whether dir holds the metadata of a hidden repository: a
@@ -810,29 +916,20 @@ func skipWalkDir(path, root string, d fs.DirEntry, cfg config) bool {
 // bare repositories it finds and the hidden ones: directories that hold a
 // .git_old but no .git, i.e. repositories whose remote was gone.
 func scan(root string, cfg config) (repos, bare, hidden []string, err error) {
-	abs, err := filepath.Abs(root)
+	abs, err := scanRoot(root)
 	if err != nil {
 		return nil, nil, nil, err
-	}
-	info, err := os.Stat(abs)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	if !info.IsDir() {
-		abs = filepath.Dir(abs)
 	}
 
-	walkErr := filepath.WalkDir(abs, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			// Unreadable directory: skip it rather than aborting the scan.
-			if d != nil && d.IsDir() {
-				return fs.SkipDir
-			}
-			return nil
-		}
-		if !d.IsDir() {
-			return nil
-		}
+	w := &walker{
+		follow:   cfg.followSymlinks,
+		seen:     map[string]bool{},
+		root:     abs,
+		rootReal: canonical(abs),
+	}
+	w.seen[w.rootReal] = true
+
+	visit := func(path string, d fs.DirEntry) error {
 		if skipWalkDir(path, abs, d, cfg) {
 			return fs.SkipDir
 		}
@@ -850,14 +947,31 @@ func scan(root string, cfg config) (repos, bare, hidden []string, err error) {
 			}
 		}
 		return nil
-	})
-	if walkErr != nil {
-		return repos, bare, hidden, walkErr
+	}
+
+	// The root itself is a directory of the tree.
+	if info := mustStat(abs); info != nil {
+		rootEntry := fs.FileInfoToDirEntry(info)
+		if err := visit(abs, rootEntry); err != nil {
+			return repos, bare, hidden, err
+		}
+	}
+	if err := w.walk(abs, w.rootReal, visit); err != nil {
+		return repos, bare, hidden, err
 	}
 	sort.Strings(repos)
 	sort.Strings(bare)
 	sort.Strings(hidden)
 	return repos, bare, hidden, nil
+}
+
+// mustStat returns the information about a path that is known to exist.
+func mustStat(path string) os.FileInfo {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil
+	}
+	return info
 }
 
 // dropGitDirs removes the bare candidates that are the git directory of a
@@ -1552,6 +1666,59 @@ func shortSHA(sha string) string {
 // main
 // ---------------------------------------------------------------------------
 
+// parseArgs parses the flags and the optional directory argument.
+//
+// The flag package stops at the first argument that is not a flag, so the
+// arguments are parsed again and again: everything that is not a flag is
+// collected, and the flags behind it are still parsed.
+//
+//	ggg ~/src          scan ~/src
+//	ggg ~/src -list    scan ~/src and only list the repositories
+func parseArgs() (string, error) {
+	var positional []string
+	args := os.Args[1:]
+	for len(args) > 0 {
+		flag.CommandLine.Parse(args)
+		rest := flag.CommandLine.Args()
+		if len(rest) == 0 {
+			break
+		}
+		positional = append(positional, rest[0])
+		args = rest[1:]
+	}
+	switch len(positional) {
+	case 0:
+		return "", nil
+	case 1:
+		return positional[0], nil
+	default:
+		return "", fmt.Errorf("at most one directory can be given, got %d", len(positional))
+	}
+}
+
+// scanRoot turns the directory to scan into an absolute path.
+//
+// A .git file belongs to the working tree next to it, so pointing at one
+// scans that working tree. Anything else that is not a directory is an
+// error: scanning the directory around it would be a surprise.
+func scanRoot(root string) (string, error) {
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		return "", err
+	}
+	if info.IsDir() {
+		return abs, nil
+	}
+	if filepath.Base(abs) == ".git" {
+		return filepath.Dir(abs), nil
+	}
+	return "", fmt.Errorf("%s is not a directory", abs)
+}
+
 func main() {
 	cfg := config{}
 
@@ -1573,8 +1740,31 @@ func main() {
 	skip := flag.String("skip", "", "regexp of paths to skip")
 	flag.IntVar(&cfg.maxDepth, "maxdepth", 0, "maximum directory depth to scan (0 = unlimited)")
 	timeout := flag.Duration("timeout", 10*time.Minute, "per-git-command timeout")
+	flag.BoolVar(&cfg.followSymlinks, "follow-symlinks", false, "walk symlinked directories too")
 	flag.Usage = usage
-	flag.Parse()
+
+	// The directory to scan can be given as an argument instead of with
+	// -root: the flag package stops at the first argument that is not a
+	// flag, so the arguments are sorted out separately and the flags behind
+	// them are still parsed.
+	dir, err := parseArgs()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s: %v\n", progName, err)
+		os.Exit(2)
+	}
+	if dir != "" {
+		rootGiven := false
+		flag.Visit(func(f *flag.Flag) {
+			if f.Name == "root" {
+				rootGiven = true
+			}
+		})
+		if rootGiven {
+			fmt.Fprintf(os.Stderr, "%s: give the directory either as an argument or with -root, not both\n", progName)
+			os.Exit(2)
+		}
+		cfg.root = dir
+	}
 
 	if *showVersion {
 		fmt.Printf("%s %s\n", progName, version)
@@ -1610,7 +1800,7 @@ func main() {
 	candidates := []string{"main", "master"}
 	cfg.candidates = candidates
 
-	root, err := filepath.Abs(cfg.root)
+	root, err := scanRoot(cfg.root)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%s: %v\n", progName, err)
 		os.Exit(2)
@@ -1636,6 +1826,9 @@ func main() {
 		for _, r := range repos {
 			fmt.Println(r)
 		}
+		if len(repos) == 0 {
+			reportEmpty(root, cfg)
+		}
 		return
 	}
 
@@ -1651,16 +1844,16 @@ func main() {
 	}
 	sort.Strings(repos)
 
+	if len(repos) == 0 {
+		reportEmpty(root, cfg)
+		return
+	}
+
 	// The repositories of this run: a submodule whose parent is one of them
 	// is synced with its parent, not on its own.
 	s.cfg.repos = make(map[string]bool, len(repos))
 	for _, r := range repos {
 		s.cfg.repos[canonical(r)] = true
-	}
-
-	if len(repos) == 0 {
-		fmt.Printf("%s: no git repositories found under %s\n", progName, root)
-		return
 	}
 
 	fmt.Printf("%s %s — syncing %d repositor%s under %s\n",
@@ -1774,7 +1967,10 @@ func usage() {
 	fmt.Fprintf(out, `%s %s — find git repositories under a directory and sync them with their remotes.
 
 Usage:
-  %s [flags]
+  %s [flags] [directory]
+
+  The directory to scan can be given as an argument or with -root; it
+  defaults to the current directory.
 
 Flags:
   -root string       directory to scan for git repositories (default ".")
@@ -1794,6 +1990,7 @@ Flags:
   -list              list the repositories and exit
   -maxdepth int      maximum directory depth to scan (0 = unlimited)
   -skip regexp      paths matching this regexp are skipped
+  -follow-symlinks   walk symlinked directories too
   -timeout duration  per-git-command timeout (default 10m0s)
   -v                 verbose output
   -version           print the version and exit

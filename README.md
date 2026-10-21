@@ -11,7 +11,8 @@ The rule it optimises for:
 ```
 go build -o ggg .        # in this directory
 ./ggg                    # sync every repo under the current directory
-./ggg -root ~/src        # sync every repo under ~/src
+./ggg ~/src              # sync every repo under ~/src
+./ggg -root ~/src        # the same
 ```
 
 ## Install
@@ -202,10 +203,15 @@ mv repo/.git_old repo/.git
   -list              list the repositories and exit
   -maxdepth int      maximum directory depth to scan (0 = unlimited)
   -skip regexp      paths matching this regexp are skipped
+  -follow-symlinks   walk symlinked directories too
   -timeout duration  per-git-command timeout (default 10m0s)
   -v                 verbose output
   -version           print the version and exit
 ```
+
+The directory to scan can be given as an argument (`ggg ~/src`) or with
+`-root`; it defaults to the current directory. Flags may come before or after
+it.
 
 ### `-auto-resolve`
 
@@ -221,7 +227,7 @@ first parent of the merge commit.
 ## Output
 
 ```
-ggg 1.5.0 — syncing 5 repositories under /home/me/src
+ggg 1.6.0 — syncing 5 repositories under /home/me/src
 
 RESTORE old    remote origin is back; .git_old renamed back to .git
 HIDDEN  gone   the remote is still gone
@@ -260,10 +266,14 @@ Exit code is `1` only when a repository actually failed.
   syncing means.
 * `node_modules`, `venv`, `__pycache__` and similar directories are skipped by
   default; use `-skip` to add your own patterns.
+* Symlinked directories are not walked by default — a symlink can lead back
+  into the tree and send the scan into a loop. `-follow-symlinks` walks them
+  anyway: the scan then keeps track of the directories it has been in, so a
+  repository behind two symlinks is still found once, and a symlink that
+  leads back into the tree does not make the scan run forever.
 * `.git_old` directories are skipped as well, so a repository that ggg 1.1
   hid is not descended into — but they are checked, and restored as soon as
   their remote answers again.
-* Symlinked directories are not followed.
 * The scan reads the working tree only; it never rewrites history.
 
 ## Testing

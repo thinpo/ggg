@@ -332,6 +332,98 @@ func TestDropGitDirs(t *testing.T) {
 	}
 }
 
+// TestScanFollowsSymlinks shows that a repository behind a symlinked
+// directory is found when the scan follows symlinks, and that a symlink
+// cannot send the scan into a loop.
+func TestScanFollowsSymlinks(t *testing.T) {
+	root := t.TempDir()
+
+	// The repository lives outside of the tree, behind a symlink.
+	outside := t.TempDir()
+	testGit(t, outside, "init", "-q", "-b", "main")
+	link := filepath.Join(root, "link")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Fatal(err)
+	}
+
+	// Without -follow-symlinks the symlink is not walked.
+	repos, _, _, err := scan(root, config{timeout: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(repos) != 0 {
+		t.Errorf("the scan found %v behind a symlink, want nothing", repos)
+	}
+
+	// With -follow-symlinks it is found.
+	repos, _, _, err = scan(root, config{timeout: time.Minute, followSymlinks: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(repos) != 1 || repos[0] != link {
+		t.Errorf("the scan found %v, want [%s]", repos, link)
+	}
+}
+
+// TestScanSurvivesSymlinkLoops shows that a symlink that leads back into the
+// tree does not send the scan into an endless loop.
+func TestScanSurvivesSymlinkLoops(t *testing.T) {
+	root := t.TempDir()
+	sub := filepath.Join(root, "sub")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	testGit(t, sub, "init", "-q", "-b", "main")
+
+	// A symlink to the root, and one to the directory above it.
+	if err := os.Symlink(root, filepath.Join(sub, "up")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Dir(root), filepath.Join(sub, "out")); err != nil {
+		t.Fatal(err)
+	}
+
+	repos, _, _, err := scan(root, config{timeout: time.Minute, followSymlinks: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(repos) != 1 || repos[0] != sub {
+		t.Errorf("the scan found %v, want [%s]", repos, sub)
+	}
+}
+
+// TestScanRootIsNotADirectory shows that a root that is not a directory is an
+// error, and that a .git file points at the working tree next to it.
+func TestScanRootIsNotADirectory(t *testing.T) {
+	root := t.TempDir()
+	file := filepath.Join(root, "notadir")
+	if err := os.WriteFile(file, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := scan(file, config{timeout: time.Minute}); err == nil {
+		t.Error("a file was accepted as the directory to scan")
+	}
+	if _, _, _, err := scan(filepath.Join(root, "missing"), config{timeout: time.Minute}); err == nil {
+		t.Error("a missing directory was accepted as the directory to scan")
+	}
+
+	// A .git file belongs to the working tree next to it.
+	work := filepath.Join(root, "work")
+	if err := os.MkdirAll(work, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(work, ".git"), []byte("gitdir: ../elsewhere\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	abs, err := scanRoot(filepath.Join(work, ".git"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if abs != work {
+		t.Errorf("scanRoot(.git) = %s, want %s", abs, work)
+	}
+}
+
 func touch(t *testing.T, path string) {
 	t.Helper()
 	now := time.Now()

@@ -203,6 +203,23 @@ remote_commit reborn
 (cd "$WORK" && NO_COLOR=1 "$GG" 2>&1 | grep -E 'RESTORE|HIDDEN' || true)
 
 echo
+echo "== arguments =="
+# The directory to scan can be given as an argument, and the flags behind it
+# are parsed too.
+check "the directory is taken as an argument" "yes" \
+  "$(cd "$WORK" && NO_COLOR=1 "$GG" "$WORK" -list | grep -q '/alpha$' && echo yes || echo no)"
+check "a flag behind the directory is parsed" "0" \
+  "$(cd "$WORK" && NO_COLOR=1 "$GG" "$WORK" -list -maxdepth 1 | grep -c 'vendor/inner')"
+check "the nested repository is listed without a limit" "1" \
+  "$(cd "$WORK" && NO_COLOR=1 "$GG" "$WORK" -list | grep -c 'vendor/inner')"
+check "the directory and -root contradict each other" "2" \
+  "$(cd "$WORK" && NO_COLOR=1 "$GG" -root "$WORK" "$WORK" >/dev/null 2>&1; echo $?)"
+check "at most one directory is accepted" "2" \
+  "$(cd "$WORK" && NO_COLOR=1 "$GG" "$WORK" "$WORK" >/dev/null 2>&1; echo $?)"
+check "a directory that does not exist is an error" "2" \
+  "$(cd "$WORK" && NO_COLOR=1 "$GG" "$WORK/missing" >/dev/null 2>&1; echo $?)"
+
+echo
 echo "== checks =="
 check "alpha fast-forwarded" "$(git -C "$WORK/alpha" rev-parse origin/main)" "$(git -C "$WORK/alpha" rev-parse HEAD)"
 check "alpha clean" "" "$(git -C "$WORK/alpha" status --porcelain)"
