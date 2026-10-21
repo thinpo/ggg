@@ -60,6 +60,10 @@ func TestLockContention(t *testing.T) {
 			lock: true,
 		},
 		{
+			msg:  "git update-ref: cannot lock ref 'refs/heads/main': reference already exists",
+			lock: false,
+		},
+		{
 			msg:  "git fetch: fatal: the remote end hung up unexpectedly",
 			lock: false,
 		},
@@ -228,6 +232,106 @@ func TestSkipSubmodule(t *testing.T) {
 	}
 }
 
+// TestScanFindsBareRepositories shows that a bare repository under a
+// directory is found, although it has no .git inside.
+func TestScanFindsBareRepositories(t *testing.T) {
+	root := t.TempDir()
+
+	// A normal repository in a subdirectory.
+	nested := filepath.Join(root, "a", "b")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	testGit(t, nested, "init", "-q", "-b", "main")
+
+	// A bare repository in a subdirectory.
+	bare := filepath.Join(root, "c", "d", "mirror.git")
+	if err := os.MkdirAll(bare, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	testGit(t, bare, "init", "--bare", "-q", "-b", "main")
+
+	repos, bareRepos, hidden, err := scan(root, config{timeout: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hidden) != 0 {
+		t.Errorf("the scan found %d hidden repositories", len(hidden))
+	}
+	if len(repos) != 1 || repos[0] != nested {
+		t.Errorf("the scan found %v, want [%s]", repos, nested)
+	}
+	if len(bareRepos) != 1 || bareRepos[0] != bare {
+		t.Errorf("the scan found the bare repositories %v, want [%s]", bareRepos, bare)
+	}
+}
+
+// TestIsBareRepoDir shows which directories are taken for a bare repository.
+func TestIsBareRepoDir(t *testing.T) {
+	dir := t.TempDir()
+
+	// A plain directory is not one.
+	if isBareRepoDir(dir) {
+		t.Error("a plain directory was taken for a bare repository")
+	}
+
+	// A directory with the layout of a git directory is a candidate.
+	gitDir := filepath.Join(dir, "mirror.git")
+	if err := os.MkdirAll(filepath.Join(gitDir, "objects"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(gitDir, "refs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(gitDir, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !isBareRepoDir(gitDir) {
+		t.Error("a directory with the layout of a git directory was not taken for a bare repository")
+	}
+
+	// A working tree is not one, even when it holds a .git.
+	work := filepath.Join(dir, "work")
+	if err := os.MkdirAll(filepath.Join(work, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if isBareRepoDir(work) {
+		t.Error("a working tree was taken for a bare repository")
+	}
+}
+
+// TestDropGitDirs shows that a git directory outside of its working tree is
+// not synced as a repository of its own.
+func TestDropGitDirs(t *testing.T) {
+	root := t.TempDir()
+
+	// A repository that keeps its metadata outside of the working tree.
+	shared := filepath.Join(root, "shared.git")
+	work := filepath.Join(root, "work")
+	if err := os.MkdirAll(work, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	testGit(t, work, "init", "-q", "--separate-git-dir="+shared, "-b", "main")
+
+	repos, bare, _, err := scan(root, config{timeout: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(repos) != 1 || repos[0] != work {
+		t.Errorf("the scan found %v, want [%s]", repos, work)
+	}
+	// git knows the working tree the git directory belongs to, so it is not
+	// a bare repository.
+	if len(bare) != 0 {
+		t.Errorf("the scan found the bare repositories %v, want none", bare)
+	}
+	// And even when it is taken for one, the git directory of a working tree
+	// is dropped: the working tree that points at it is synced.
+	if kept := dropGitDirs([]string{shared}, repos, time.Minute); len(kept) != 0 {
+		t.Errorf("the git directory of a working tree was kept: %v", kept)
+	}
+}
+
 func touch(t *testing.T, path string) {
 	t.Helper()
 	now := time.Now()
@@ -235,7 +339,6 @@ func touch(t *testing.T, path string) {
 		t.Fatal(err)
 	}
 }
-
 func modTime(t *testing.T, path string) time.Time {
 	t.Helper()
 	st, err := os.Stat(path)

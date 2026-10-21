@@ -26,6 +26,10 @@
 //     If even that fails, ggg aborts the merge, switches to the default
 //     branch, syncs it, and leaves the feature branch intact with its local
 //     commits.
+//  6. In a bare repository (no working tree): fetches into the
+//     remote-tracking branches and fast-forwards the local branches that the
+//     remote contains. A branch with commits of its own is left alone - a
+//     bare repository cannot merge.
 //
 // ggg never force-pushes, never resets --hard over commits, and never drops a
 // stash that did not apply cleanly.
@@ -53,7 +57,7 @@ const progName = "ggg"
 
 // version is the release version. It is overridden at build time with
 // -ldflags "-X main.version=1.2.3".
-var version = "1.4.0"
+var version = "1.5.0"
 
 // ---------------------------------------------------------------------------
 // configuration
@@ -285,6 +289,12 @@ func lockContention(err error) (string, bool) {
 	if m := lockFileRE.FindStringSubmatch(msg); m != nil {
 		return m[1], true
 	}
+	// A reference that already exists is not a lock another process holds:
+	// git words it like a failed lock ("cannot lock ref ...: reference
+	// already exists"), but no one has to release anything.
+	if strings.Contains(msg, "reference already exists") {
+		return "", false
+	}
 	switch {
 	case strings.Contains(msg, "index.lock"),
 		strings.Contains(msg, "packed-refs.lock"),
@@ -341,6 +351,49 @@ func (g git) unmerged() int {
 
 func (g git) hasCommits() bool {
 	return g.runRead("rev-parse", "--verify", "--quiet", "HEAD") == nil
+}
+
+// isBare reports whether the repository has no working tree.
+func (g git) isBare() bool {
+	out, err := g.output("rev-parse", "--is-bare-repository")
+	return err == nil && strings.TrimSpace(out) == "true"
+}
+
+// remoteBranchSHAs lists the branches of the remote with their commit.
+//
+// A bare repository is often a mirror: it has no remote-tracking branches, so
+// the remote itself is asked.
+func (g git) remoteBranchSHAs(remote string) map[string]string {
+	out, err := g.output("ls-remote", "--heads", remote)
+	if err != nil {
+		return nil
+	}
+	shas := make(map[string]string)
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 {
+			continue
+		}
+		shas[strings.TrimPrefix(fields[1], "refs/heads/")] = fields[0]
+	}
+	return shas
+}
+
+// localBranches lists the branches of the repository, without the
+// refs/heads/ prefix.
+func (g git) localBranches() []string {
+	out, err := g.output("for-each-ref", "--format=%(refname)", "refs/heads")
+	if err != nil {
+		return nil
+	}
+	var names []string
+	for _, l := range strings.Split(out, "\n") {
+		l = strings.TrimSpace(l)
+		if name := strings.TrimPrefix(l, "refs/heads/"); name != "" && name != l {
+			names = append(names, name)
+		}
+	}
+	return names
 }
 
 // inProgressOp names the unfinished git operation, if any.
@@ -684,6 +737,37 @@ func isRepoDir(dir string) bool {
 	return st.IsDir() || st.Mode().IsRegular()
 }
 
+// isBareRepoDir reports whether dir looks like the git directory of a bare
+// repository: a directory with the layout of a git directory (HEAD, objects
+// and refs) and no working tree of its own.
+//
+// A bare repository has no .git inside, so it is found by its layout instead.
+// The layout is only a hint - isBareRepository confirms the candidates with
+// git.
+func isBareRepoDir(dir string) bool {
+	if isRepoDir(dir) {
+		return false
+	}
+	st, err := os.Stat(filepath.Join(dir, "HEAD"))
+	if err != nil || !st.Mode().IsRegular() {
+		return false
+	}
+	for _, sub := range []string{"objects", "refs"} {
+		st, err := os.Stat(filepath.Join(dir, sub))
+		if err != nil || !st.IsDir() {
+			return false
+		}
+	}
+	return true
+}
+
+// isBareRepository confirms with git that dir is a bare repository.
+func isBareRepository(dir string, timeout time.Duration) bool {
+	g := git{dir: dir, timeout: timeout}
+	out, err := g.output("rev-parse", "--is-bare-repository")
+	return err == nil && strings.TrimSpace(out) == "true"
+}
+
 // hasGitOld reports whether dir holds the metadata of a hidden repository: a
 // .git_old without a .git.
 func hasGitOld(dir string) bool {
@@ -722,17 +806,17 @@ func skipWalkDir(path, root string, d fs.DirEntry, cfg config) bool {
 	return false
 }
 
-// scan walks the tree once and returns the git repositories it finds plus the
-// hidden ones: directories that hold a .git_old but no .git, i.e. repositories
-// whose remote was gone.
-func scan(root string, cfg config) (repos, hidden []string, err error) {
+// scan walks the tree once and returns the git repositories it finds, the
+// bare repositories it finds and the hidden ones: directories that hold a
+// .git_old but no .git, i.e. repositories whose remote was gone.
+func scan(root string, cfg config) (repos, bare, hidden []string, err error) {
 	abs, err := filepath.Abs(root)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	info, err := os.Stat(abs)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	if !info.IsDir() {
 		abs = filepath.Dir(abs)
@@ -757,15 +841,53 @@ func scan(root string, cfg config) (repos, hidden []string, err error) {
 			repos = append(repos, path)
 		case hasGitOld(path):
 			hidden = append(hidden, path)
+		case isBareRepoDir(path):
+			// A bare repository has no working tree, so there is nothing
+			// to find inside it.
+			if isBareRepository(path, cfg.timeout) {
+				bare = append(bare, path)
+				return fs.SkipDir
+			}
 		}
 		return nil
 	})
 	if walkErr != nil {
-		return repos, hidden, walkErr
+		return repos, bare, hidden, walkErr
 	}
 	sort.Strings(repos)
+	sort.Strings(bare)
 	sort.Strings(hidden)
-	return repos, hidden, nil
+	return repos, bare, hidden, nil
+}
+
+// dropGitDirs removes the bare candidates that are the git directory of a
+// repository that was found as well.
+//
+// A repository can keep its metadata outside of its working tree (git init
+// --separate-git-dir). Such a git directory is not a repository of its own:
+// the working tree that points at it is. Syncing both would write the same
+// references twice.
+func dropGitDirs(bare, repos []string, timeout time.Duration) []string {
+	if len(bare) == 0 || len(repos) == 0 {
+		return bare
+	}
+	gitDirs := make(map[string]bool, len(repos))
+	for _, r := range repos {
+		g := git{dir: r, timeout: timeout}
+		out, err := g.output("rev-parse", "--absolute-git-dir")
+		if err != nil {
+			continue
+		}
+		gitDirs[canonical(out)] = true
+	}
+	kept := make([]string, 0, len(bare))
+	for _, b := range bare {
+		if gitDirs[canonical(b)] {
+			continue
+		}
+		kept = append(kept, b)
+	}
+	return kept
 }
 
 // ---------------------------------------------------------------------------
@@ -838,9 +960,8 @@ func (s *syncer) syncOne(path string) result {
 	}
 
 	// --- 0. sanity checks ---------------------------------------------------
-	if out, err := g.output("rev-parse", "--is-bare-repository"); err == nil && strings.TrimSpace(out) == "true" {
-		return res.skip(start, "bare repository")
-	}
+	// A bare repository has no working tree: it is synced on its own terms.
+	bare := g.isBare()
 	if op := g.inProgressOp(); op != "" {
 		if !s.cfg.recover {
 			return res.skip(start, "unfinished "+op+" in progress")
@@ -883,7 +1004,16 @@ func (s *syncer) syncOne(path string) result {
 			return s.localOnly(start, &res, err)
 		}
 	}
-	if err := g.mutate("fetch", "--prune", remote); err != nil {
+	fetchArgs := []string{"fetch", "--prune", remote}
+	if bare {
+		// A bare repository is often a mirror: its configured refspec writes
+		// the remote branches straight into refs/heads, and it is forced (+),
+		// so a fetch would throw away local commits. ggg fetches into the
+		// remote-tracking branches instead and moves the local branches
+		// itself - but only when that is a fast-forward.
+		fetchArgs = []string{"fetch", "--prune", remote, "+refs/heads/*:refs/remotes/" + remote + "/*"}
+	}
+	if err := g.mutate(fetchArgs...); err != nil {
 		fetchFailed = true
 		res.st = statusWarn
 		res.note("fetch failed: %v", err)
@@ -893,6 +1023,10 @@ func (s *syncer) syncOne(path string) result {
 			// changed - the repository is left exactly as it is.
 			return s.localOnly(start, &res, err)
 		}
+	}
+
+	if bare {
+		return s.syncBareRepo(g, remote, &res, start)
 	}
 
 	// --- 3. branch layout ---------------------------------------------------
@@ -1029,6 +1163,142 @@ func (s *syncer) syncOne(path string) result {
 		if err := g.mutate("submodule", "update", "--init", "--recursive"); err != nil {
 			res.st = statusWarn
 			res.note("submodule update failed: %v", err)
+		}
+	}
+
+	return res.finish(start)
+}
+
+// syncBareRepo synchronises a bare repository.
+//
+// A bare repository has no working tree: there is nothing to stash and no
+// merge commit can be created, so a local commit can never be reconciled with
+// the remote - that would mean throwing it away. ggg therefore only moves a
+// branch when the remote branch contains it (a fast-forward) and leaves every
+// other branch exactly as it is.
+func (s *syncer) syncBareRepo(g git, remote string, res *result, start time.Time) result {
+	branch := g.currentBranch()
+	if branch == "" {
+		return res.skip(start, "detached HEAD; fetched only")
+	}
+	res.branch = branch
+
+	defBranch := g.defaultBranch(remote, s.cfg.candidates)
+	if defBranch == "" {
+		return res.skip(start, "no default branch found on "+remote)
+	}
+
+	// The branch the HEAD points at does not exist yet: the repository is
+	// empty (or only has other branches). Create it from the remote, so that
+	// the repository has a valid HEAD.
+	if !g.branchExists(branch) {
+		source := remote + "/" + branch
+		if !g.refExists(source) {
+			source = remote + "/" + defBranch
+		}
+		if !g.refExists(source) {
+			return res.skip(start, "remote branch "+source+" does not exist")
+		}
+		sha, err := g.output("rev-parse", source)
+		if err != nil {
+			return res.fail(start, "could not read %s: %v", source, err)
+		}
+		if err := g.mutate("-c", "core.logAllRefUpdates=true", "update-ref", "-m",
+			"ggg: create "+branch+" from "+source, "refs/heads/"+branch, sha, ""); err != nil {
+			return res.fail(start, "could not create %s from %s: %v", branch, source, err)
+		}
+		res.summary = "create " + branch + " from " + source
+		return res.finish(start)
+	}
+
+	// Every branch that the remote also has is fast-forwarded - but only
+	// when the remote branch contains the local one.
+	var moved, planned, blocked []string
+	// The remote branches the local branches are compared with. They are
+	// known locally after a fetch; a mirror that never fetched is asked
+	// directly, so that the plan of a dry run is not empty.
+	remoteSHAs := map[string]string{}
+	if s.cfg.dryRun {
+		remoteSHAs = g.remoteBranchSHAs(remote)
+	}
+	for _, b := range g.localBranches() {
+		local := "refs/heads/" + b
+		target := remote + "/" + b
+		targetSHA, err := g.output("rev-parse", target)
+		known := err == nil
+		if !known {
+			sha, ok := remoteSHAs[b]
+			if !ok {
+				// The remote does not have this branch: it is a local one.
+				continue
+			}
+			targetSHA = sha
+		}
+		localSHA, err := g.output("rev-parse", local)
+		if err != nil {
+			continue
+		}
+		if localSHA == targetSHA {
+			continue
+		}
+		if !known {
+			// The commit of the remote branch is not in this repository, so
+			// it cannot be checked whether the remote contains the local
+			// branch: the plan says what is going to be tried.
+			planned = append(planned, b)
+			res.note("%s is at %s, the remote branch %s is at %s; it is fast-forwarded when the remote "+
+				"contains it", local, shortSHA(localSHA), target, shortSHA(targetSHA))
+			if s.cfg.dryRun {
+				_ = g.mutate("-c", "core.logAllRefUpdates=true", "update-ref", "-m",
+					"ggg: fast-forward to "+target, local, targetSHA, localSHA)
+			}
+			continue
+		}
+		if !g.isAncestor(local, target) {
+			// The remote does not contain the local branch: it has commits
+			// of its own, or the two have diverged. A bare repository cannot
+			// merge them, so the branch stays where it is.
+			blocked = append(blocked, b)
+			res.note("%s was not moved: %s does not contain it and a bare repository cannot merge",
+				local, target)
+			continue
+		}
+		if err := g.mutate("-c", "core.logAllRefUpdates=true", "update-ref", "-m",
+			"ggg: fast-forward to "+target, local, targetSHA, localSHA); err != nil {
+			res.st = statusWarn
+			res.note("could not fast-forward %s: %v", local, err)
+			blocked = append(blocked, b)
+			continue
+		}
+		moved = append(moved, b)
+	}
+
+	switch {
+	case len(moved) == 0 && len(planned) == 0 && len(blocked) == 0:
+		res.summary = "up to date"
+	case len(moved) == 0 && len(planned) == 0:
+		res.st = statusWarn
+		res.summary = "not synced: " + remote + " does not contain the local branch"
+	case len(moved) == 0:
+		res.summary = "sync " + strings.Join(planned, ", ") + " with " + remote
+	case len(moved) == 1:
+		res.summary = "fast-forward to " + remote + "/" + moved[0]
+	default:
+		res.summary = "fast-forward " + strconv.Itoa(len(moved)) + " branches to " + remote
+	}
+	if len(blocked) > 0 {
+		res.st = statusWarn
+	}
+
+	// --- optional push ------------------------------------------------------
+	if s.cfg.push && !s.cfg.dryRun {
+		if up := g.upstreamOf(branch); up != "" {
+			if err := g.mutate("push", remote, branch); err != nil {
+				res.st = statusWarn
+				res.note("push failed: %v", err)
+			} else {
+				res.note("pushed %s to %s", branch, up)
+			}
 		}
 	}
 
@@ -1351,10 +1621,17 @@ func main() {
 
 	s := &syncer{cfg: cfg}
 
-	repos, hidden, err := scan(root, cfg)
+	repos, bare, hidden, err := scan(root, cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%s: %v\n", progName, err)
 	}
+	// A bare candidate that is the git directory of a repository that was
+	// found as well belongs to that repository, not to a repository of its
+	// own.
+	bare = dropGitDirs(bare, repos, cfg.timeout)
+	repos = append(repos, bare...)
+	sort.Strings(repos)
+
 	if cfg.listOnly {
 		for _, r := range repos {
 			fmt.Println(r)

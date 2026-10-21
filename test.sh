@@ -97,8 +97,17 @@ git -C "$WORK/up" remote rename origin upstream; remote_commit up
 # 12 repository without commits
 seed fresh; git init -q -b main "$WORK/fresh"
 git -C "$WORK/fresh" remote add origin "$REMOTE/fresh.git"
-# 13 bare repository
-git init --bare -q -b main "$WORK/bare.git"
+# 13 bare repository: a mirror of a remote that moves ahead
+seed bare; git clone --bare -q "$REMOTE/bare.git" "$WORK/bare.git"; remote_commit bare
+# 13b bare repository with a commit of its own: the remote does not contain
+#     it, and a bare repository cannot merge, so the branch stays where it is
+seed stubborn; git clone --bare -q "$REMOTE/stubborn.git" "$WORK/stubborn.git"
+git -C "$WORK/stubborn.git" config user.name Test
+git -C "$WORK/stubborn.git" config user.email t@e.st
+STUBBORN_COMMIT=$(echo stub | git -C "$WORK/stubborn.git" commit-tree \
+  "$(git -C "$WORK/stubborn.git" rev-parse 'main^{tree}')" -p main -m "local only commit")
+git -C "$WORK/stubborn.git" update-ref refs/heads/main "$STUBBORN_COMMIT"
+remote_commit stubborn
 # 14 a real submodule inside a parent repository
 seed subparent; git clone -q "$REMOTE/subparent.git" "$WORK/subparent"
 seed submod
@@ -214,6 +223,18 @@ check "nested repo synced" "origin/main" "$(git -C "$WORK/outer/vendor/inner" re
 check "upstream remote used" "upstream/main" "$(git -C "$WORK/up" rev-parse --abbrev-ref '@{upstream}')"
 check "fresh repo initialised" "main" "$(git -C "$WORK/fresh" rev-parse --abbrev-ref HEAD)"
 check "fresh repo has commits" "1" "$(git -C "$WORK/fresh" rev-list --count HEAD)"
+check "bare repository found" "yes" \
+  "$(cd "$WORK" && NO_COLOR=1 "$GG" -list | grep -q 'bare.git' && echo yes || echo no)"
+check "bare repository fast-forwarded" "$(git -C "$REMOTE/bare.git" rev-parse main)" \
+  "$(git -C "$WORK/bare.git" rev-parse refs/heads/main)"
+check "bare repository keeps its remote-tracking branch" "$(git -C "$REMOTE/bare.git" rev-parse main)" \
+  "$(git -C "$WORK/bare.git" rev-parse refs/remotes/origin/main)"
+check "bare repository with a local commit kept" "$STUBBORN_COMMIT" \
+  "$(git -C "$WORK/stubborn.git" rev-parse refs/heads/main)"
+check "bare repository with a local commit reported" "yes" \
+  "$(echo "$SYNC_OUT" | grep 'stubborn.git' | grep -q 'not synced' && echo yes || echo no)"
+check "bare repository with a local commit is fetched" "$(git -C "$REMOTE/stubborn.git" rev-parse main)" \
+  "$(git -C "$WORK/stubborn.git" rev-parse refs/remotes/origin/main)"
 check "nothing failed" "0" "$(echo "$SYNC_OUT" | grep -c '^FAIL')"
 check "pointer parent synced" "origin/main" "$(git -C "$WORK/pointer" rev-parse --abbrev-ref '@{upstream}')"
 check "pointer submodule kept" " M sub" "$(git -C "$WORK/pointer" status --porcelain | head -1)"

@@ -49,6 +49,7 @@ cd ggg && make install        # installs into ~/local/bin/ggg
 | stash pop conflicts | the stash is **kept** and the conflict is reported — nothing is lost |
 | another git process holds a lock file | the command is waited for and tried again — the repository is not failed |
 | a submodule of a repository in the same run | synced with its parent (see [Submodules](#submodules)) |
+| bare repository (no working tree) | fetched into its remote-tracking branches, and every branch the remote contains is fast-forwarded — a branch with commits of its own is left alone (see [Bare repositories](#bare-repositories)) |
 | remote repository is gone (deleted, renamed, no longer visible) | the local copy is all that is left: the repository is skipped and left completely untouched — nothing is synced, nothing is renamed |
 | the remote of a repository hidden by ggg 1.1 is back | `.git_old` is renamed back to `.git` and the repository is synced again |
 
@@ -85,6 +86,34 @@ Three flags change this:
   its pointer, the submodule is fetched.
 * `-skip-submodules` leaves every submodule alone, also the ones whose parent
   is not part of the run.
+
+## Bare repositories
+
+A bare repository — a directory with a git directory in it, but no working tree
+— is found as well. It has no `.git` inside, so it is recognised by its
+layout (`HEAD`, `objects`, `refs`) and confirmed with git.
+
+A bare repository cannot be synced like a normal one: there is no working
+tree, so nothing can be stashed and no merge commit can be created. A local
+commit can therefore never be reconciled with the remote — that would mean
+throwing it away. `ggg` instead:
+
+* fetches into the remote-tracking branches (`refs/remotes/<remote>/*`) and not
+  into `refs/heads/*`: a mirror's own refspec writes the remote branches
+  straight into the local branches, and it is forced (`+`), so a fetch would
+  throw away local commits;
+* moves a local branch to the remote branch it tracks, but only when the
+  remote contains it — a fast-forward;
+* leaves a branch that has commits of its own, or that has diverged, exactly
+  where it is.
+
+```
+OK   mirror.git   fast-forward to origin/main
+WARN stubborn.git  not synced: origin does not contain the local branch
+```
+
+A branch that is moved is written with `git update-ref`, and the commit it
+pointed at stays in the reflog.
 
 ## Lock files
 
@@ -192,7 +221,7 @@ first parent of the merge commit.
 ## Output
 
 ```
-ggg 1.4.0 — syncing 5 repositories under /home/me/src
+ggg 1.5.0 — syncing 5 repositories under /home/me/src
 
 RESTORE old    remote origin is back; .git_old renamed back to .git
 HIDDEN  gone   the remote is still gone
@@ -216,9 +245,10 @@ Exit code is `1` only when a repository actually failed.
 ## Notes
 
 * Repositories are found by looking for a `.git` directory *or* file, so
-  worktrees and submodules are picked up too. Nested repositories (a repo
-  inside another repo's working tree) are synced as well — each one
-  independently.
+  worktrees and submodules are picked up too. A directory that is a git
+  directory itself — a bare repository — is found by its layout. Nested
+  repositories (a repo inside another repo's working tree) are synced as well
+  — each one independently.
 * A submodule lives on a detached HEAD at the commit its parent pins. `ggg`
   fetches it but does not move it, so the parent's pointer stays put. A
   submodule of a repository in the same run is not synced at all, because the
@@ -241,7 +271,8 @@ Exit code is `1` only when a repository actually failed.
 `test.sh` builds throw-away remotes and clones covering every branch of the
 algorithm (fast-forward, dirty tree, feature branch, conflicting feature
 branch, diverged main, `master` remote, unfinished merge, detached HEAD,
-nested repo, non-`origin` remote, repository without commits, deleted remote
+nested repo, non-`origin` remote, repository without commits, bare repository
+— fast-forwarded and with a commit of its own, deleted remote
 → local-only repository, repository hidden by ggg 1.1 and restored, submodule
 of a repository in the same run, and a repository whose lock file is held by
 another process) and asserts the resulting state:

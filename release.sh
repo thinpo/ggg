@@ -85,6 +85,9 @@ Find every git repository under a directory and sync each one with its remote.
 - feature branches get their upstream and \`origin/main\` merged in
 - conflicts are auto-resolved with \`-X theirs\`; unresolvable merges fall back
   to \`main\` and the feature branch is kept intact
+- bare repositories are found as well: they are fetched into their
+  remote-tracking branches and fast-forwarded, while a branch with commits of
+  its own is left alone - a bare repository cannot merge
 - a remote that is really gone is reported as a local-only repository and
   left completely untouched: nothing is synced, nothing is renamed
 - a repository hidden by ggg 1.1 is restored when its remote comes back
